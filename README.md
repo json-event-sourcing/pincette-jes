@@ -341,3 +341,19 @@ See [javadoc](https://www.javadoc.io/doc/net.pincette/pincette-jes/latest/index.
 groupId: net.pincette
 
 artifactId: pincette-jes
+
+## The Maven Archetype
+
+You can generate a new project with the following command:
+
+```
+mvn archetype:generate -B \
+                       -DarchetypeGroupId=net.pincette \
+                       -DarchetypeArtifactId=pincette-jes-archetype \
+                       -DarchetypeVersion=1.0 \
+                       -DgroupId=net.pincette \
+                       -DartifactId=myapp \
+                       -Dversion=1.0-SNAPSHOT
+```
+
+The will produce the above-mentioned demonstration project. You can build it with ```mvn clean package```. This will also run the tests, so make sure Kafka and MongoDB are running and create the Kafka topics with the ```create_topics.sh``` script.
