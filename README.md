@@ -304,11 +304,11 @@ There are two exceptions to these rules. The user ```system``` is always allowed
 
 ## Auditing
 
-Optionally an audit Kafka topic can be given to an aggregate. For each event a message will be published on this topic. It's fields are defined in the class  [AuditFields](https://www.javadoc.io/static/net.pincette/pincette-jes-util/1.0.4/net/pincette/jes/util/AuditFields.html).
+Optionally an audit Kafka topic can be given to an aggregate. For each event a message will be published on this topic. It's fields are defined in the class  [```AuditFields```](https://www.javadoc.io/static/net.pincette/pincette-jes-util/1.0.4/net/pincette/jes/util/AuditFields.html).
 
 ## Monitoring
 
-When the monitoring option is turned on each step in the aggregate produces a message on the monitoring Kafka topic. Together, the steps can be used to assemble an execution profile. The names of the steps are defined in the class [MonitorSteps](https://www.javadoc.io/static/net.pincette/pincette-jes/1.0/net/pincette/jes/MonitorSteps.html). The fields in the messages are defined as follows:
+When the monitoring option is turned on each step in the aggregate produces a message on the monitoring Kafka topic. Together, the steps can be used to assemble an execution profile. The names of the steps are defined in the class [```MonitorSteps```](https://www.javadoc.io/static/net.pincette/pincette-jes/1.0/net/pincette/jes/MonitorSteps.html). The fields in the messages are defined as follows:
 
 |Name|Description|
 |----|-----------|
@@ -321,7 +321,7 @@ The class [APM](https://www.javadoc.io/static/net.pincette/pincette-jes-elastic/
 
 ## Reacting to Change
 
-Often one type of aggregate wants to react to changes that are published by another one. Possibly the former will not do this directly. There may be an intermediate microservice that makes such connections. In any case an event has to be converted to a command, perhaps based on some criteria. The function [```changed```](https://www.javadoc.io/static/net.pincette/pincette-jes-util/1.0.4/net/pincette/jes/util/Event.html#changed-javax.json.JsonObject-java.lang.String-) is handy in this case. You can write things like this:
+Often one type of aggregate wants to react to changes that are published by another one. Possibly the former will not do this directly. There may be an intermediate microservice that makes such connections. In any case an event has to be converted to a command, perhaps based on some criteria. The function [```changed```](https://www.javadoc.io/static/net.pincette/pincette-jes-util/1.1/net/pincette/jes/util/Event.html#changed-javax.json.JsonObject-java.lang.String-) is handy in this case. You can write things like this:
 
 ```
 final KStream<String, JsonObject> stream = builder.stream("plusminus-counter-event-dev");
@@ -330,6 +330,55 @@ stream
     .filter((k, v) -> changed(v, "/value"))
     .mapValues(v -> createCommand(event))
     .to("myapp-mytype-command-dev");
+```
+
+In general, however, the command has to be sent to several aggregate instances based on some criterion. So an event will be mapped to potentially more than one command, one for each destination aggregate instance. Moreover, if the query to obtain the destination results in a non-blocking asynchronous stream of many items then things can become complicated.
+
+The Kafka Streams API provides the ```flatMap``` function where instead of mapping a value to another value you map it to a list of values, in the form of an ```Iterable```. You can do the query synchronously and accumulate the result in a list, but this is not very efficient. The complete result would be held in memory and it would add more blocking I/O to the blocking Kafka Streams API.
+
+The goal of the ```Reactor``` class is to make such a scenario simpler. You give it a source and destination aggregate type, a function to obtain the destination instances and a transformation function that transforms an event into a command. It will listen to the "event-full" topic of the source aggregate. For every event it calls your transformation function and pairs the result with every destination instance. The pairings produce complete commands that are sent to the "command" topic of the destination aggregate.
+
+The destination function should return a ```Publisher<JsonObject>```. You can use the functions [```aggregationPublisher```](https://www.javadoc.io/static/net.pincette/pincette-jes-util/1.1/net/pincette/jes/util/Mongo.html#aggregationPublisher-com.mongodb.reactivestreams.client.MongoCollection-java.util.List-) and [```findPublisher```](https://www.javadoc.io/static/net.pincette/pincette-jes-util/1.1/net/pincette/jes/util/Mongo.html#findPublisher-com.mongodb.reactivestreams.client.MongoCollection-org.bson.conversions.Bson-) for this. The JSON objects in the result should at least have the ```_id``` field. The transformation function should produce the command, with at least the field ```_command```. The fields ```_id```, ```_type```, ```_corr``` and ```_timestamp``` will be set by the reactor. The correlation ID will be the same as the one on the incomming event.
+
+Optionally you can provide a filter function that selects the events of interest. However, if the transformation function returns ```null``` or a JSON object without the ```_command``` field the result will be ignored, which is why the filter function is optional.
+
+The following is an example in the context of the ```plusminus``` aggregate shown above. Whenever the value of a counter goes from 9 to 10 the other counters will receive the ```plus``` command. So the source and destination aggregate types are the same in this case.
+
+```
+  private static StreamsBuilder createReactor(
+      final StreamsBuilder builder, final Config config, final MongoClient mongoClient) {
+    final String environment = getEnvironment(config);
+
+    return new Reactor()
+        .withBuilder(builder)
+        .withEnvironment(environment)
+        .withSourceType("plusminus-counter")
+        .withDestinationType("plusminus-counter")
+        .withDestinations(
+            event ->
+                getOthers(
+                    event.getString(ID),
+                    mongoClient.getDatabase(config.getString(MONGODB_DATABASE)),
+                    environment))
+        .withEventToCommand(Application::createCommand)
+        .withFilter(event -> changed(event, "/value", createValue(9), createValue(10)))
+        .build();
+  }
+
+  private static CompletionStage<JsonObject> createCommand(final JsonObject event) {
+    return completedFuture(createObjectBuilder().add(COMMAND, "plus").build());
+  }
+
+  static String getEnvironment(final Config config) {
+    return tryToGetSilent(() -> config.getString(ENVIRONMENT)).orElse(DEV);
+  }
+
+  private static Publisher<JsonObject> getOthers(
+      final String id, final MongoDatabase database, final String environment) {
+    return aggregationPublisher(
+        database.getCollection("plusminus-counter-" + environment),
+        list(match(addNotDeleted(ne(ID, id))), project(include(ID))));
+  }
 ```
 
 ## API Documentation

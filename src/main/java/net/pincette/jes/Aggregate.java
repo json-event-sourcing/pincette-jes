@@ -39,11 +39,11 @@ import static net.pincette.jes.util.Mongo.find;
 import static net.pincette.jes.util.Mongo.findOne;
 import static net.pincette.jes.util.Mongo.restore;
 import static net.pincette.jes.util.Mongo.update;
+import static net.pincette.json.JsonUtil.getBoolean;
+import static net.pincette.json.JsonUtil.getString;
 import static net.pincette.util.Builder.create;
 import static net.pincette.util.Collections.list;
 import static net.pincette.util.Collections.set;
-import static net.pincette.util.Json.getBoolean;
-import static net.pincette.util.Json.getString;
 import static net.pincette.util.Util.getStackTrace;
 import static net.pincette.util.Util.must;
 import static net.pincette.util.Util.tryToGet;
@@ -570,7 +570,13 @@ public class Aggregate {
                     .orElseGet(() -> completedFuture(currentState)));
   }
 
-  private String fullType() {
+  /**
+   * Returns the full aggregate type, which is composed as &lt;app&gt;-&lt;type&gt;.
+   *
+   * @return The full aggregate type.
+   * @since 1.1
+   */
+  public String fullType() {
     return app + "-" + type;
   }
 
