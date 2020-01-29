@@ -281,7 +281,6 @@ elastic {
   log {
     uri = "https://xxxxxxxxxxxx.eu-central-1.aws.cloud.es.io:9243/log/_doc/"
     authorizationHeader = "Basic xxxxxxxxxx"
-    level = "INFO"
   }
 }
 ```
@@ -300,7 +299,19 @@ Next to role-based and function-based access control it is sometimes also necess
 
 The ```Aggregate``` class checks if the field ```_acl``` is present in the current state of an aggregate instance. Without the field the command is allowed. Otherwise it should contain a subobject, where each field is the name of a command. The value is an array of role names, which is matched with the field ```/_jwt/roles``` in the command. If the intersection is not empty then the command is good to go. If there is no field in ```_acl``` that corresponds to the command then the fallback field ```write``` is tried. If that is also not available then the command is allowed.
 
-There are two exceptions to these rules. The user ```system``` is always allowed and if the aggregate has the "breaking the glass" option turned on, the boolean field ```/_jwt/breakingTheGlass``` is checked. This feature should only be used with auditing turned on. 
+There are two exceptions to these rules. The user ```system``` is always allowed and if the aggregate has the "breaking the glass" option turned on, the boolean field ```/_jwt/breakingTheGlass``` is checked. This feature should only be used with auditing turned on.
+
+## Logging
+
+In the example above all logging was connected to Elasticsearch with a simple function. However, you don't necessarily want your microservices to contact Elasticsearch directly. Perhaps you're not even using Elasticsearch.
+
+An alternative is to send all log messages to Kafka. For aggregates there is the prebaked function [```logKafka```](https://www.javadoc.io/static/net.pincette/pincette-jes-elastic/1.1.2/net/pincette/jes/elastic/Logging.html#logKafka-net.pincette.jes.Aggregate-java.util.logging.Level-java.lang.String-java.lang.String-). This will convert commands and events to Elastic Common Schema messages and route them to a Kafka topic for logging. You can call it like this:
+
+```
+logKafka(myAggregate, INFO, "1.0", "log-tst");
+```
+
+Other kinds of logging can be integrated in your Kafka Streams statements. The class [```ElasticCommonSchema```](https://www.javadoc.io/static/net.pincette/pincette-jes-elastic/1.1.2/net/pincette/jes/elastic/ElasticCommonSchema.html) makes it easy to generate ECS messages. You can add additional Streams statements by splitting an original stream chain in two. The first part goes into a local constant. You then connect the second part to the constant and you also connect the log stream to it. This yields a kind of tee structure.
 
 ## Auditing
 
@@ -318,6 +329,12 @@ When the monitoring option is turned on each step in the aggregate produces a me
 |timestamp|The timestamp in epoch millis.|
 
 The class [APM](https://www.javadoc.io/static/net.pincette/pincette-jes-elastic/1.0.2/net/pincette/jes/elastic/APM.html) is an example of how these messages can be consumed.
+
+## Serialisation
+
+All messages are serialised with the [JSON Event Sourcing serialiser](https://www.javadoc.io/static/net.pincette/pincette-jes-util/1.1.1/net/pincette/jes/util/JsonSerde.html). It first encodes a ```JsonObject``` in [CBOR](https://tools.ietf.org/html/rfc7049). Then it is compressed in GZIP format (see also [RFC 1951](https://tools.ietf.org/html/rfc1951) and [RFC 1952](https://tools.ietf.org/html/rfc1952)). The deserialiser falls back to JSON in string format.
+
+The command line tool [pincette-jes-prodcon](https://github.com/json-event-sourcing/pincette-jes-prodcon) makes it easy to consume and produce messages using this serialisation.
 
 ## Reacting to Change
 
@@ -381,6 +398,14 @@ The following is an example in the context of the ```plusminus``` aggregate show
   }
 ```
 
+## Troubleshooting
+
+When you have a number of connected microservices it may not always be easy to find where something goes wrong. Since everything is connected to Kafka things are very observable. All you have to do is tap some topics with [pincette-jes-prodcon](https://github.com/json-event-sourcing/pincette-jes-prodcon). This will tell you where an expected message didn't arrive or where a wrong one was produced.
+
+Another handy tool is the correlation ID. Every command has one and they are propagated to the events and snapshots. Commands and events can be logged in Elastic Common Schema format. The correlation ID is always written in the field ```trace.id```. Searching on that field will give you a trail of what has happened.
+
+Sometimes you will need a debugger, but hopefully not on production. For debugging one microservice you don't need to have the whole environment running on your machine. Say you have an issue with some microservice on the test cluster. You can shut down that service in the cluster and launch it in the debugger on your machine, with exactly the same Kafka configuration. This makes sure all topic partitions are served by your instance. 
+
 ## API Documentation
 
 See [javadoc](https://www.javadoc.io/doc/net.pincette/pincette-jes/latest/index.html).
@@ -399,7 +424,7 @@ You can generate a new project with the following command:
 mvn archetype:generate -B \
                        -DarchetypeGroupId=net.pincette \
                        -DarchetypeArtifactId=pincette-jes-archetype \
-                       -DarchetypeVersion=1.0.1 \
+                       -DarchetypeVersion=1.0.3 \
                        -DgroupId=net.pincette \
                        -DartifactId=myapp \
                        -Dversion=1.0-SNAPSHOT

@@ -6,11 +6,11 @@
 
   <groupId>net.pincette</groupId>
   <artifactId>pincette-jes</artifactId>
-  <version>1.1</version>
+  <version>1.1.1</version>
   <packaging>jar</packaging>
   <name>pincette-jes</name>
   <description>JSON Event Sourcing With Kafka and MongoDB</description>
-  <url>https://github.com/wdonne/pincette-jes</url>
+  <url>https://github.com/json-event-sourcing/pincette-jes</url>
 
   <organization>
     <name>Pincette</name>
@@ -18,9 +18,9 @@
   </organization>
 
   <scm>
-    <url>https://github.com/wdonne/pincette-jes</url>
-    <connection>scm:git@github.com:wdonne/pincette-jes.git</connection>
-    <developerConnection>scm:git@github.com:wdonne/pincette-jes.git</developerConnection>
+    <url>https://github.com/json-event-sourcing/pincette-jes</url>
+    <connection>scm:git@github.com:json-event-sourcing/pincette-jes.git</connection>
+    <developerConnection>scm:git@github.com:json-event-sourcing/pincette-jes.git</developerConnection>
   </scm>
 
   <developers>
@@ -62,7 +62,7 @@
     <dependency>
       <groupId>net.pincette</groupId>
       <artifactId>pincette-jes-util</artifactId>
-      <version>1.1</version>
+      <version>1.1.2</version>
     </dependency>
     <dependency>
       <groupId>net.pincette</groupId>
@@ -72,7 +72,7 @@
     <dependency>
       <groupId>net.pincette</groupId>
       <artifactId>pincette-mongo</artifactId>
-      <version>1.0.1</version>
+      <version>1.1</version>
     </dependency>
     <dependency>
       <groupId>net.pincette</groupId>
@@ -130,9 +130,9 @@
           </additionalJOptions>
           <links>
             <link>http://docs.oracle.com/javase/8/docs/api/</link>
-            <link>https://www.javadoc.io/doc/net.pincette/pincette-jes-util/1.1/</link>
+            <link>https://www.javadoc.io/doc/net.pincette/pincette-jes-util/1.1.2/</link>
             <link>https://www.javadoc.io/doc/net.pincette/pincette-common/1.6.6/</link>
-            <link>https://www.javadoc.io/doc/net.pincette/pincette-mongo/1.0.1/</link>
+            <link>https://www.javadoc.io/doc/net.pincette/pincette-mongo/1.1/</link>
             <link>https://www.javadoc.io/doc/net.pincette/pincette-json/1.0/</link>
             <link>https://www.javadoc.io/doc/javax.json/javax.json-api/1.1.4/</link>
             <link>https://www.javadoc.io/doc/org.apache.kafka/kafka-streams/2.3.1/</link>

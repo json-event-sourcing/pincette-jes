@@ -37,8 +37,10 @@ import static net.pincette.jes.util.JsonFields.TIMESTAMP;
 import static net.pincette.jes.util.JsonFields.TYPE;
 import static net.pincette.jes.util.Mongo.find;
 import static net.pincette.jes.util.Mongo.findOne;
+import static net.pincette.jes.util.Mongo.insert;
 import static net.pincette.jes.util.Mongo.restore;
 import static net.pincette.jes.util.Mongo.update;
+import static net.pincette.jes.util.Streams.duplicateFilter;
 import static net.pincette.json.JsonUtil.getBoolean;
 import static net.pincette.json.JsonUtil.getString;
 import static net.pincette.util.Builder.create;
@@ -224,6 +226,10 @@ public class Aggregate {
         .add(STATUS_CODE, 403)
         .add("message", "Forbidden")
         .build();
+  }
+
+  private static String commandDuplicateKey(final JsonObject command) {
+    return command.getString(ID) + command.getString(CORR) + command.getString(COMMAND);
   }
 
   private static JsonObject completeCommand(final JsonObject command) {
@@ -511,9 +517,12 @@ public class Aggregate {
   private KStream<String, JsonObject> createCommands() {
     final KStream<String, JsonObject> com = builder.stream(topic(COMMAND_TOPIC));
     final KStream<String, JsonObject> commandFilter =
-        com.filter((k, v) -> isCommand(v))
-            .map((k, v) -> new KeyValue<>(k.toLowerCase(), idsToLowerCase(v)))
-            .mapValues(Aggregate::completeCommand);
+        duplicateFilter(
+            com.filter((k, v) -> isCommand(v))
+                .map((k, v) -> new KeyValue<>(k.toLowerCase(), idsToLowerCase(v)))
+                .mapValues(Aggregate::completeCommand),
+            (k, v) -> commandDuplicateKey(v),
+            ofSeconds(60));
 
     monitorCommands(commandFilter);
 
@@ -591,7 +600,8 @@ public class Aggregate {
                         currentState ->
                             currentState
                                 .map(state -> (CompletionStage<JsonObject>) completedFuture(state))
-                                .orElseGet(() -> restore(id, fullType(), environment, database))));
+                                .orElseGet(() -> restore(id, fullType(), environment, database))))
+        .thenComposeAsync(currentState -> restore(currentState, environment, database));
   }
 
   private CompletionStage<Optional<JsonObject>> getMongoCurrentState(final String id) {
@@ -601,6 +611,11 @@ public class Aggregate {
   private CompletionStage<Optional<JsonObject>> getMongoEntity(
       final String collection, final String id) {
     return findOne(database.getCollection(collection), eq(ID, id));
+  }
+
+  private CompletionStage<Boolean> insertMongoEvent(final JsonObject event) {
+    return insert(setId(event, mongoEventKey(event)), mongoEventCollection(), database)
+        .thenApply(result -> must(result, r -> r));
   }
 
   private CompletionStage<Boolean> isDuplicate(final JsonObject command) {
@@ -756,9 +771,8 @@ public class Aggregate {
 
   private CompletionStage<JsonObject> saveReduction(final JsonObject reduction) {
     return isEvent(reduction)
-        ? updateMongoEvent(plainEvent(reduction))
-            .thenComposeAsync(
-                result -> update(reduction.getJsonObject(AFTER), environment, database))
+        ? insertMongoEvent(plainEvent(reduction))
+            .thenComposeAsync(result -> updateMongoAggregate(reduction.getJsonObject(AFTER)))
             .thenApply(result -> reduction)
         : completedFuture(reduction);
   }
@@ -784,11 +798,21 @@ public class Aggregate {
     return type;
   }
 
-  private CompletionStage<Boolean> updateMongoEvent(final JsonObject event) {
-    final String id = mongoEventKey(event);
+  private CompletionStage<Boolean> updateMongoAggregate(final JsonObject aggregate) {
+    return update(aggregate, environment, database).thenApply(result -> must(result, r -> r));
+  }
 
-    return update(setId(event, id), id, mongoEventCollection(), database)
-        .thenApply(result -> must(result, r -> r));
+  /**
+   * Sets the name of the application. This will become the prefix of the aggregate type.
+   *
+   * @param app the application name.
+   * @return The aggregate object itself.
+   * @since 1.0
+   */
+  public Aggregate withApp(final String app) {
+    this.app = app;
+
+    return this;
   }
 
   /**
@@ -802,19 +826,6 @@ public class Aggregate {
    */
   public Aggregate withAudit(final String auditTopic) {
     this.auditTopic = auditTopic;
-
-    return this;
-  }
-
-  /**
-   * Sets the name of the application. This will become the prefix of the aggregate type.
-   *
-   * @param app the application name.
-   * @return The aggregate object itself.
-   * @since 1.0
-   */
-  public Aggregate withApp(final String app) {
-    this.app = app;
 
     return this;
   }
@@ -881,6 +892,19 @@ public class Aggregate {
   }
 
   /**
+   * The MongoDB database in which the events and aggregates are written.
+   *
+   * @param database the database connection.
+   * @return The aggregate object itself.
+   * @since 1.0
+   */
+  public Aggregate withMongoDatabase(final MongoDatabase database) {
+    this.database = database;
+
+    return this;
+  }
+
+  /**
    * Turns on monitoring. This publishes monitoring messages on the
    * &lt;aggregate-type&gt;-monitor-&lt;environment&gt; topic. A message is in JSON and always
    * contains the fields "step" and "timestamp". The former is defined in <code>MonitorSteps</code>.
@@ -895,19 +919,6 @@ public class Aggregate {
    */
   public Aggregate withMonitoring(final boolean monitoring) {
     this.monitoring = monitoring;
-
-    return this;
-  }
-
-  /**
-   * The MongoDB database in which the events and aggregates are written.
-   *
-   * @param database the database connection.
-   * @return The aggregate object itself.
-   * @since 1.0
-   */
-  public Aggregate withMongoDatabase(final MongoDatabase database) {
-    this.database = database;
 
     return this;
   }
