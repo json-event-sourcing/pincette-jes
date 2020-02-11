@@ -43,13 +43,16 @@ import static net.pincette.jes.util.Mongo.update;
 import static net.pincette.jes.util.Streams.duplicateFilter;
 import static net.pincette.json.JsonUtil.getBoolean;
 import static net.pincette.json.JsonUtil.getString;
+import static net.pincette.mongo.Collection.deleteOne;
 import static net.pincette.util.Builder.create;
 import static net.pincette.util.Collections.list;
 import static net.pincette.util.Collections.set;
 import static net.pincette.util.Util.getStackTrace;
 import static net.pincette.util.Util.must;
+import static net.pincette.util.Util.rethrow;
 import static net.pincette.util.Util.tryToGet;
 
+import com.mongodb.client.result.DeleteResult;
 import com.mongodb.reactivestreams.client.MongoDatabase;
 import java.time.Duration;
 import java.util.HashMap;
@@ -57,6 +60,7 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.CompletionStage;
+import java.util.function.Function;
 import javax.json.JsonArray;
 import javax.json.JsonNumber;
 import javax.json.JsonObject;
@@ -531,6 +535,19 @@ public class Aggregate {
         : commandFilter);
   }
 
+  private CompletionStage<Boolean> deleteMongoAggregate(final JsonObject aggregate) {
+    return deleteOne(
+            database.getCollection(mongoAggregateCollection()), eq(ID, aggregate.getString(ID)))
+        .thenApply(result -> must(result, DeleteResult::wasAcknowledged))
+        .thenApply(result -> true);
+  }
+
+  private CompletionStage<Boolean> deleteMongoEvent(final JsonObject event) {
+    return deleteOne(database.getCollection(mongoEventCollection()), eq(ID, mongoEventKey(event)))
+        .thenApply(result -> must(result, DeleteResult::wasAcknowledged))
+        .thenApply(result -> true);
+  }
+
   /**
    * Returns the environment.
    *
@@ -601,7 +618,11 @@ public class Aggregate {
                             currentState
                                 .map(state -> (CompletionStage<JsonObject>) completedFuture(state))
                                 .orElseGet(() -> restore(id, fullType(), environment, database))))
-        .thenComposeAsync(currentState -> restore(currentState, environment, database));
+        .thenComposeAsync(
+            currentState ->
+                !currentState.isEmpty()
+                    ? restore(currentState, environment, database)
+                    : completedFuture(currentState));
   }
 
   private CompletionStage<Optional<JsonObject>> getMongoCurrentState(final String id) {
@@ -770,10 +791,19 @@ public class Aggregate {
   }
 
   private CompletionStage<JsonObject> saveReduction(final JsonObject reduction) {
+    final Function<JsonObject, CompletionStage<Boolean>> handleAggregate =
+        a -> a.getBoolean(DELETED, false) ? deleteMongoAggregate(a) : updateMongoAggregate(a);
+
     return isEvent(reduction)
         ? insertMongoEvent(plainEvent(reduction))
-            .thenComposeAsync(result -> updateMongoAggregate(reduction.getJsonObject(AFTER)))
+            .thenComposeAsync(result -> handleAggregate.apply(reduction.getJsonObject(AFTER)))
             .thenApply(result -> reduction)
+            .exceptionally(
+                e -> {
+                  deleteMongoEvent(reduction);
+                  rethrow(e);
+                  return null;
+                })
         : completedFuture(reduction);
   }
 
