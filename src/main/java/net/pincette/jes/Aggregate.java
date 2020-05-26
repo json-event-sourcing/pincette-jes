@@ -8,6 +8,7 @@ import static java.lang.String.valueOf;
 import static java.time.Duration.ofSeconds;
 import static java.time.Instant.now;
 import static java.util.Arrays.fill;
+import static java.util.Arrays.stream;
 import static java.util.concurrent.CompletableFuture.completedFuture;
 import static javax.json.Json.createArrayBuilder;
 import static javax.json.Json.createDiff;
@@ -60,7 +61,9 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.CompletionStage;
+import java.util.function.BinaryOperator;
 import java.util.function.Function;
+import java.util.function.UnaryOperator;
 import javax.json.JsonArray;
 import javax.json.JsonNumber;
 import javax.json.JsonObject;
@@ -185,6 +188,8 @@ public class Aggregate {
   private static final String EVENT_FULL_TOPIC = "event-full";
   private static final String EXCEPTION = "exception";
   private static final String MONITOR_TOPIC = "monitor";
+  private static final String REDUCER_COMMAND = "command";
+  private static final String REDUCER_STATE = "state";
   private static final String REPLY_TOPIC = "reply";
   private static final String STEP = "step";
   private static final String STEP_AFTER = "after";
@@ -316,6 +321,10 @@ public class Aggregate {
         .build();
   }
 
+  private static JsonObject createSource(final JsonObject command, final JsonObject state) {
+    return createObjectBuilder().add(REDUCER_STATE, state).add(REDUCER_COMMAND, command).build();
+  }
+
   private static JsonObject createStep(
       final String step, final String after, final long timestamp) {
     return createStep(step, after, timestamp, null);
@@ -416,6 +425,35 @@ public class Aggregate {
    */
   public static CompletionStage<JsonObject> put(final JsonObject command) {
     return completedFuture(createObjectBuilder(command).remove(COMMAND).build());
+  }
+
+  /**
+   * Wraps a generic transformer in a <code>Reducer</code>. The first argument will be the command
+   * and the second the current state of the aggregate.
+   *
+   * @param transformer the given transformer.
+   * @return The wrapped transformer.
+   * @since 1.1.4
+   */
+  public static Reducer reducer(final BinaryOperator<JsonObject> transformer) {
+    return (command, state) -> completedFuture(transformer.apply(command, state));
+  }
+
+  /**
+   * Wraps a sequence of generic transformers in a <code>Reducer</code>. The result of one
+   * transformer is fed to the next. The JSON object that is given to the sequence has the fields
+   * <code>command</code> and <code>state</code>. The transformer should produce the new state.
+   *
+   * @param transformers the given transformer sequence.
+   * @return The wrapped transformer sequence.
+   * @since 1.1.4
+   */
+  @SafeVarargs
+  public static Reducer reducer(final UnaryOperator<JsonObject>... transformers) {
+    final UnaryOperator<JsonObject> function =
+        stream(transformers).reduce(json -> json, (result, t) -> (j -> t.apply(result.apply(j))));
+
+    return (command, state) -> completedFuture(function.apply(createSource(command, state)));
   }
 
   private static JsonObjectBuilder removeTechnical(final JsonObject json) {

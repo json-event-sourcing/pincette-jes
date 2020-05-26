@@ -1,27 +1,29 @@
-  # JSON Event Sourcing
+# JSON Event Sourcing
 
-  * [Introduction](#introduction)
-  * [Domain Driven Design](#domain-driven-design)
-  * [Command Query Responsibility Segregation](#command-query-responsibility-segregation)
-  * [This Library](#this-library)
-  * [Aggregates](#aggregates)
-  * [Commands](#commands)
-  * [Events](#events)
-  * [The Anatomy of an Application](#the-anatomy-of-an-application)
-  * [The Kafka Topics](#the-kafka-topics)
-  * [Testing](#testing)
-  * [Configuration](#configuration)
-  * [The HTTP API](#the-http-api)
-  * [Access Control](#access-control)
-  * [Logging](#logging)
-  * [Server\-Sent Events](#server-sent-events)
-  * [Auditing](#auditing)
-  * [Serialisation](#serialisation)
-  * [Reacting to Change](#reacting-to-change)
-  * [Troubleshooting](#troubleshooting)
-  * [API Documentation](#api-documentation)
-  * [The Artifact](#the-artifact)
-  * [The Maven Archetype](#the-maven-archetype)
+- [Introduction](#introduction)
+- [Domain Driven Design](#domain-driven-design)
+- [Command Query Responsibility Segregation](#command-query-responsibility-segregation)
+- [This Library](#this-library)
+- [Aggregates](#aggregates)
+- [Commands](#commands)
+- [Events](#events)
+- [The Anatomy of an Application](#the-anatomy-of-an-application)
+- [The Kafka Topics](#the-kafka-topics)
+- [Testing](#testing)
+- [Configuration](#configuration)
+- [The HTTP API](#the-http-api)
+- [Access Control](#access-control)
+- [Logging](#logging)
+- [Server-Sent Events](#server-sent-events)
+- [Auditing](#auditing)
+- [Serialisation](#serialisation)
+- [Reacting to Change](#reacting-to-change)
+- [Validation](#validation)
+- [Using JSLT](#using-jslt)
+- [Troubleshooting](#troubleshooting)
+- [API Documentation](#api-documentation)
+- [The Artifact](#the-artifact)
+- [The Maven Archetype](#the-maven-archetype)
 
 ## Introduction
 
@@ -390,6 +392,58 @@ The following is an example in the context of the ```plusminus``` aggregate show
   }
 ```
 
+## Validation
+
+You may want to protect the integrity of your aggregates through validation of the commands that are sent to it. This can be done by splitting a reducer in two. Both parts have the same signature, i.e. they receive the command and the current state of the aggregate instance and produce the resulting JSON. The first part does the validation. It always returns the command, either with error annotations or not. Only in the former case the second part is called. So the reply topic will get either a failed command or the new version of the aggregate instance. This scenario can be set up with the [compose](https://www.javadoc.io/static/net.pincette/pincette-jes-util/1.3/net/pincette/jes/util/Util.html#compose-net.pincette.jes.util.Reducer-net.pincette.jes.util.Reducer-) function.
+
+It is possible to do the validation in a declarative way with the 
+[validator](https://www.javadoc.io/static/net.pincette/pincette-jes-util/1.3/net/pincette/jes/util/Validation.html#validator-java.lang.String-net.pincette.mongo.Validator-) function. It uses the 
+[Mongo Validator](https://www.javadoc.io/static/net.pincette/pincette-mongo/1.3.1/net/pincette/mongo/Validator.html), which allows you to write validation conditions in the 
+[MongoDB query](https://www.javadoc.io/static/net.pincette/pincette-mongo/1.3.1/net/pincette/mongo/Match.html) language. The following is an example.
+
+```
+final net.pincette.mongo.Validator specs = new net.pincette.mongo.Validator();
+final net.pincette.jes.Aggregate =
+  new net.pincette.jes.Aggregate()
+    .withReducer(
+      "MyCommand",
+     compose(
+       net.pincette.jes.util.Validation.validator(
+         "resource:/validators/my_command.json",
+         specs),
+       Application::myCommandReducer
+     ))
+    ...     
+```
+
+## Using JSLT
+
+It is not necessary to always write your reducers in Java. The 
+[JSLT](https://github.com/schibsted/jslt) language is an easy alternative to do all kinds of JSON transformations. In order to add it easily to an aggregate you can use the 
+[reducer](https://www.javadoc.io/static/net.pincette/pincette-jes/1.1.4/net/pincette/jes/Aggregate.html#reducer--) function and combine it with a 
+[transformer](https://www.javadoc.io/static/net.pincette/pincette-json/1.3.2/net/pincette/json/Jslt.html). It would look like this:
+
+```
+final net.pincette.jes.Aggregate =
+  new net.pincette.jes.Aggregate()
+    .withReducer(
+      "MyCommand",
+      net.pincette.jes.Aggregate.reducer(
+        net.pincette.json.Jslt.transformer("/reducers/my_command.jslt")))
+    ...      
+```
+
+The transformer is given a JSON object with the fields ```command``` and ```state```. It should produce the new state. The following is a reducer for a command that only updates ```myfield```. Everything else in the aggregate instance is kept as it is. The pipe operator moves the context to the ```state``` field.
+
+```
+let command = (.command) // Save the command field.
+
+.state | {
+  "myfield": $command.myfield,
+  *: .  
+}
+```
+
 ## Troubleshooting
 
 When you have a number of connected microservices it may not always be easy to find where something goes wrong. Since everything is connected to Kafka things are very observable. All you have to do is tap some topics with [pincette-jes-prodcon](https://github.com/json-event-sourcing/pincette-jes-prodcon). This will tell you where an expected message didn't arrive or where a wrong one was produced.
@@ -416,7 +470,7 @@ You can generate a new project with the following command:
 mvn archetype:generate -B \
                        -DarchetypeGroupId=net.pincette \
                        -DarchetypeArtifactId=pincette-jes-archetype \
-                       -DarchetypeVersion=1.0.4 \
+                       -DarchetypeVersion=1.0.5 \
                        -DgroupId=net.pincette \
                        -DartifactId=myapp \
                        -Dversion=1.0-SNAPSHOT

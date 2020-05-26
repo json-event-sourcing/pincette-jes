@@ -1,6 +1,7 @@
 package net.pincette.jes;
 
 import static java.time.Instant.now;
+import static java.util.concurrent.CompletableFuture.completedFuture;
 import static javax.json.Json.createObjectBuilder;
 import static net.pincette.jes.util.Event.isEvent;
 import static net.pincette.jes.util.JsonFields.COMMAND;
@@ -16,6 +17,7 @@ import static net.pincette.util.Util.tryToGetRethrow;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.function.Predicate;
+import java.util.function.UnaryOperator;
 import javax.json.JsonObject;
 import net.pincette.json.JsonUtil;
 import org.apache.kafka.streams.KeyValue;
@@ -39,6 +41,17 @@ public class Reactor {
   private EventToCommand eventToCommand;
   private Predicate<JsonObject> filter;
   private String sourceType;
+
+  /**
+   * Wraps a generic transformer in an <code>EventToCommand</code>.
+   *
+   * @param transformer the given transformer.
+   * @return The wrapped transformer.
+   * @since 1.1.4
+   */
+  public static EventToCommand eventToCommand(final UnaryOperator<JsonObject> transformer) {
+    return event -> completedFuture(transformer.apply(event));
+  }
 
   public StreamsBuilder build() {
     final KStream<String, JsonObject> stream =
