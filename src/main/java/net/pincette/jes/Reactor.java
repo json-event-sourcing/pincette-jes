@@ -2,7 +2,6 @@ package net.pincette.jes;
 
 import static java.time.Instant.now;
 import static java.util.concurrent.CompletableFuture.completedFuture;
-import static javax.json.Json.createObjectBuilder;
 import static net.pincette.jes.util.Event.isEvent;
 import static net.pincette.jes.util.JsonFields.COMMAND;
 import static net.pincette.jes.util.JsonFields.CORR;
@@ -10,6 +9,7 @@ import static net.pincette.jes.util.JsonFields.ID;
 import static net.pincette.jes.util.JsonFields.JWT;
 import static net.pincette.jes.util.JsonFields.TIMESTAMP;
 import static net.pincette.jes.util.JsonFields.TYPE;
+import static net.pincette.json.JsonUtil.createObjectBuilder;
 import static net.pincette.rs.Chain.with;
 import static net.pincette.rs.Util.iterate;
 import static net.pincette.util.Util.tryToGetRethrow;

@@ -10,10 +10,6 @@ import static java.time.Instant.now;
 import static java.util.Arrays.fill;
 import static java.util.Arrays.stream;
 import static java.util.concurrent.CompletableFuture.completedFuture;
-import static javax.json.Json.createArrayBuilder;
-import static javax.json.Json.createDiff;
-import static javax.json.Json.createObjectBuilder;
-import static javax.json.Json.createPatch;
 import static net.pincette.jes.util.Command.hasError;
 import static net.pincette.jes.util.Command.isAllowed;
 import static net.pincette.jes.util.Command.isCommand;
@@ -36,15 +32,19 @@ import static net.pincette.jes.util.JsonFields.STATUS_CODE;
 import static net.pincette.jes.util.JsonFields.TEST;
 import static net.pincette.jes.util.JsonFields.TIMESTAMP;
 import static net.pincette.jes.util.JsonFields.TYPE;
-import static net.pincette.jes.util.Mongo.find;
-import static net.pincette.jes.util.Mongo.findOne;
 import static net.pincette.jes.util.Mongo.insert;
 import static net.pincette.jes.util.Mongo.restore;
 import static net.pincette.jes.util.Mongo.update;
 import static net.pincette.jes.util.Streams.duplicateFilter;
+import static net.pincette.json.JsonUtil.createArrayBuilder;
+import static net.pincette.json.JsonUtil.createDiff;
+import static net.pincette.json.JsonUtil.createObjectBuilder;
+import static net.pincette.json.JsonUtil.createPatch;
 import static net.pincette.json.JsonUtil.getBoolean;
 import static net.pincette.json.JsonUtil.getString;
 import static net.pincette.mongo.Collection.deleteOne;
+import static net.pincette.mongo.JsonClient.find;
+import static net.pincette.mongo.JsonClient.findOne;
 import static net.pincette.util.Builder.create;
 import static net.pincette.util.Collections.list;
 import static net.pincette.util.Collections.set;
@@ -71,6 +71,7 @@ import javax.json.JsonObjectBuilder;
 import net.pincette.function.SideEffect;
 import net.pincette.jes.util.AuditFields;
 import net.pincette.jes.util.Reducer;
+import net.pincette.json.JsonUtil;
 import net.pincette.util.TimedCache;
 import org.apache.kafka.streams.KeyValue;
 import org.apache.kafka.streams.StreamsBuilder;
@@ -332,7 +333,7 @@ public class Aggregate {
 
   private static JsonObject createStep(
       final String step, final String after, final long timestamp, final String command) {
-    return create(javax.json.Json::createObjectBuilder)
+    return create(JsonUtil::createObjectBuilder)
         .update(b -> b.add(STEP, step))
         .update(b -> b.add(STEP_TIMESTAMP, timestamp))
         .updateIf(b -> after != null, b -> b.add(STEP_AFTER, after))
