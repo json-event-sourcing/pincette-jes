@@ -491,6 +491,14 @@ public class Aggregate {
     return createObjectBuilder(json).add(ID, id).build();
   }
 
+  private static JsonObject uniqueError(final JsonObject command) {
+    return createObjectBuilder(command)
+        .add(ERROR, true)
+        .add(STATUS_CODE, 400)
+        .add("message", "Missing unique expression fields")
+        .build();
+  }
+
   /**
    * Returns the aggregate stream.
    *
@@ -571,12 +579,15 @@ public class Aggregate {
     return builder;
   }
 
-  private String commandKey(final JsonObject command) {
+  private JsonObject checkUnique(final JsonObject command) {
+    return uniqueFunction != null && commandKey(command) == null ? uniqueError(command) : command;
+  }
+
+  private JsonValue commandKey(final JsonObject command) {
     return ofNullable(uniqueFunction)
         .map(f -> f.apply(command))
         .filter(k -> !k.equals(NULL))
-        .map(JsonUtil::string)
-        .orElseGet(() -> command.getString(ID));
+        .orElse(null);
   }
 
   private KStream<String, JsonObject> commandSource() {
@@ -685,7 +696,7 @@ public class Aggregate {
 
   private CompletionStage<JsonObject> getCurrentState(final JsonObject command) {
     return aggregateCache
-        .get(commandKey(command))
+        .get(uniqueFunction != null ? string(commandKey(command)) : command.getString(ID))
         .map(currentState -> (CompletionStage<JsonObject>) completedFuture(currentState))
         .orElseGet(
             () ->
@@ -844,14 +855,21 @@ public class Aggregate {
   }
 
   private CompletionStage<JsonObject> reduceCommand(final JsonObject command) {
-    return getCurrentState(command)
-        .thenApply(currentState -> makeManaged(currentState, command))
-        .thenComposeAsync(
-            currentState ->
-                isAllowed(currentState, command, breakingTheGlass)
-                    ? executeReducer(command, currentState)
-                        .thenApply(newState -> processNewState(currentState, newState, command))
-                    : completedFuture(accessError(command)));
+    final JsonObject checked = checkUnique(command);
+
+    return hasError(checked)
+        ? completedFuture(checked)
+        : getCurrentState(command)
+            .thenApply(currentState -> makeManaged(currentState, command))
+            .thenComposeAsync(currentState -> reduceIfAllowed(currentState, command));
+  }
+
+  private CompletionStage<JsonObject> reduceIfAllowed(
+      final JsonObject currentState, final JsonObject command) {
+    return isAllowed(currentState, command, breakingTheGlass)
+        ? executeReducer(command, currentState)
+            .thenApply(newState -> processNewState(currentState, newState, command))
+        : completedFuture(accessError(command));
   }
 
   private KStream<String, JsonObject> reducer() {
