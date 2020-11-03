@@ -45,6 +45,7 @@ import static net.pincette.json.JsonUtil.createObjectBuilder;
 import static net.pincette.json.JsonUtil.createPatch;
 import static net.pincette.json.JsonUtil.getBoolean;
 import static net.pincette.json.JsonUtil.getString;
+import static net.pincette.json.JsonUtil.isObject;
 import static net.pincette.json.JsonUtil.string;
 import static net.pincette.mongo.BsonUtil.fromJson;
 import static net.pincette.mongo.Collection.deleteOne;
@@ -759,12 +760,14 @@ public class Aggregate {
   private Bson mongoStateQuery(final JsonValue value) {
     return addNotDeleted(
         fromJson(
-            createObjectBuilder()
-                .add(
-                    "$expr",
-                    createObjectBuilder()
-                        .add("$eq", createArrayBuilder().add(uniqueExpression).add(value)))
-                .build()));
+            isObject(value)
+                ? value.asJsonObject()
+                : createObjectBuilder()
+                    .add(
+                        "$expr",
+                        createObjectBuilder()
+                            .add("$eq", createArrayBuilder().add(uniqueExpression).add(value)))
+                    .build()));
   }
 
   private void monitorCommands(final KStream<String, JsonObject> commands) {

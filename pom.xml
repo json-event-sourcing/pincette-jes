@@ -6,7 +6,7 @@
 
   <groupId>net.pincette</groupId>
   <artifactId>pincette-jes</artifactId>
-  <version>1.2.1</version>
+  <version>1.2.2</version>
   <packaging>jar</packaging>
   <name>pincette-jes</name>
   <description>JSON Event Sourcing With Kafka and MongoDB</description>

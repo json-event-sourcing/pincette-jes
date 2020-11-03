@@ -247,6 +247,17 @@ Whether this is useful or not depends on the use-case. When you have a stream of
 
 When you use this feature the Kafka topic with the purpose "unique" should exist. You should also make sure all commands have the fields that constitute the unique expression.
 
+Unique expressions involving only one scalar field are very simple. The expression is then ```"$<field-name>"```. Sometimes, however, uniqueness can depend on several fields. You could write an expression that turns this into some scalar value, but that wouldn't be efficient. You could not make use of a MongoDB index. Therefore, a unique expression is also allowed to be a JSON object. You would write the expression like this:
+
+```
+{
+  "field1": "$field1",
+  "field2": "$field2"  
+}
+```
+
+As with scalar values the field references are used to extract the values from the command. The result is a plain equality expression for MongoDB.
+
 ## The Kafka Topics
 
 The external interface at runtime is a set op Kafka topics. Their names always have the form ```<app>-<type>-<purpose>-<environment>```. The following topics are expected to exist (the names are the purpose):
@@ -480,7 +491,7 @@ You can generate a new project with the following command:
 mvn archetype:generate -B \
                        -DarchetypeGroupId=net.pincette \
                        -DarchetypeArtifactId=pincette-jes-archetype \
-                       -DarchetypeVersion=1.0.9 \
+                       -DarchetypeVersion=1.0.10 \
                        -DgroupId=net.pincette \
                        -DartifactId=myapp \
                        -Dversion=1.0-SNAPSHOT
