@@ -8,5 +8,7 @@ module net.pincette.jes {
   requires net.pincette.common;
   requires kafka.streams;
   requires net.pincette.rs;
+  requires org.mongodb.driver.reactivestreams;
+  requires org.mongodb.bson;
   exports net.pincette.jes;
 }

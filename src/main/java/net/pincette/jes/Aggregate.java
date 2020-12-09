@@ -1,5 +1,6 @@
 package net.pincette.jes;
 
+import static com.mongodb.WriteConcern.MAJORITY;
 import static com.mongodb.client.model.Filters.and;
 import static com.mongodb.client.model.Filters.eq;
 import static com.mongodb.client.model.Filters.regex;
@@ -35,9 +36,7 @@ import static net.pincette.jes.util.JsonFields.TEST;
 import static net.pincette.jes.util.JsonFields.TIMESTAMP;
 import static net.pincette.jes.util.JsonFields.TYPE;
 import static net.pincette.jes.util.Mongo.addNotDeleted;
-import static net.pincette.jes.util.Mongo.insert;
 import static net.pincette.jes.util.Mongo.restore;
-import static net.pincette.jes.util.Mongo.update;
 import static net.pincette.jes.util.Streams.duplicateFilter;
 import static net.pincette.json.JsonUtil.createArrayBuilder;
 import static net.pincette.json.JsonUtil.createDiff;
@@ -52,6 +51,8 @@ import static net.pincette.mongo.Collection.deleteOne;
 import static net.pincette.mongo.Expression.function;
 import static net.pincette.mongo.JsonClient.find;
 import static net.pincette.mongo.JsonClient.findOne;
+import static net.pincette.mongo.JsonClient.insert;
+import static net.pincette.mongo.JsonClient.update;
 import static net.pincette.util.Builder.create;
 import static net.pincette.util.Collections.list;
 import static net.pincette.util.Collections.set;
@@ -62,7 +63,6 @@ import static net.pincette.util.Util.rethrow;
 import static net.pincette.util.Util.tryToGet;
 
 import com.mongodb.ReadConcern;
-import com.mongodb.WriteConcern;
 import com.mongodb.client.result.DeleteResult;
 import com.mongodb.reactivestreams.client.MongoCollection;
 import com.mongodb.reactivestreams.client.MongoDatabase;
@@ -232,7 +232,6 @@ public class Aggregate {
   private KStream<String, JsonObject> eventsFull;
   private KStream<String, JsonObject> monitor;
   private boolean monitoring;
-  private KStream<String, JsonObject> nonuniqueCommands;
   private Reducer reducer;
   private KStream<String, JsonObject> replies;
   private String type;
@@ -580,6 +579,10 @@ public class Aggregate {
     return builder;
   }
 
+  private String cacheKey(final JsonObject command) {
+    return uniqueFunction != null ? string(commandKey(command)) : command.getString(ID);
+  }
+
   private JsonObject checkUnique(final JsonObject command) {
     return uniqueFunction != null && commandKey(command) == null ? uniqueError(command) : command;
   }
@@ -592,9 +595,7 @@ public class Aggregate {
   }
 
   private KStream<String, JsonObject> commandSource() {
-    return uniqueFunction != null
-        ? nonuniqueCommands.merge(builder.stream(topic(UNIQUE_TOPIC)))
-        : commands;
+    return uniqueFunction != null ? builder.stream(topic(UNIQUE_TOPIC)) : commands;
   }
 
   /**
@@ -625,14 +626,13 @@ public class Aggregate {
   }
 
   private CompletionStage<Boolean> deleteMongoAggregate(final JsonObject aggregate) {
-    return deleteOne(
-            database.getCollection(mongoAggregateCollection()), eq(ID, aggregate.getString(ID)))
+    return deleteOne(aggregateCollection, eq(ID, aggregate.getString(ID)))
         .thenApply(result -> must(result, DeleteResult::wasAcknowledged))
         .thenApply(result -> true);
   }
 
   private CompletionStage<Boolean> deleteMongoEvent(final JsonObject event) {
-    return deleteOne(database.getCollection(mongoEventCollection()), eq(ID, mongoEventKey(event)))
+    return deleteOne(eventCollection, eq(ID, mongoEventKey(event)))
         .thenApply(result -> must(result, DeleteResult::wasAcknowledged))
         .thenApply(result -> true);
   }
@@ -697,7 +697,7 @@ public class Aggregate {
 
   private CompletionStage<JsonObject> getCurrentState(final JsonObject command) {
     return aggregateCache
-        .get(uniqueFunction != null ? string(commandKey(command)) : command.getString(ID))
+        .get(cacheKey(command))
         .map(currentState -> (CompletionStage<JsonObject>) completedFuture(currentState))
         .orElseGet(
             () ->
@@ -714,7 +714,7 @@ public class Aggregate {
   }
 
   private CompletionStage<Boolean> insertMongoEvent(final JsonObject event) {
-    return insert(setId(event, mongoEventKey(event)), mongoEventCollection(), database)
+    return insert(eventCollection, setId(event, mongoEventKey(event)))
         .thenApply(result -> must(result, r -> r));
   }
 
@@ -726,6 +726,12 @@ public class Aggregate {
                 eq(CORR, command.getString(CORR)),
                 eq(COMMAND, command.getString(COMMAND))))
         .thenApply(result -> !result.isEmpty());
+  }
+
+  private JsonObject keepId(final JsonObject currentState, final JsonObject command) {
+    return uniqueFunction != null
+        ? createObjectBuilder(command).add(ID, currentState.getString(ID)).build()
+        : command;
   }
 
   /**
@@ -837,7 +843,7 @@ public class Aggregate {
         .map(
             event ->
                 SideEffect.<JsonObject>run(
-                        () -> aggregateCache.put(event.getString(ID), event.getJsonObject(AFTER)))
+                        () -> aggregateCache.put(cacheKey(command), event.getJsonObject(AFTER)))
                     .andThenGet(() -> event))
         .orElse(newState);
   }
@@ -864,7 +870,8 @@ public class Aggregate {
         ? completedFuture(checked)
         : getCurrentState(command)
             .thenApply(currentState -> makeManaged(currentState, command))
-            .thenComposeAsync(currentState -> reduceIfAllowed(currentState, command));
+            .thenComposeAsync(
+                currentState -> reduceIfAllowed(currentState, keepId(currentState, command)));
   }
 
   private CompletionStage<JsonObject> reduceIfAllowed(
@@ -937,7 +944,6 @@ public class Aggregate {
           .filter((k, p) -> !p.second.equals(NULL))
           .map((k, p) -> new KeyValue<>(string(p.second), p.first))
           .to(topic(UNIQUE_TOPIC));
-      nonuniqueCommands = applied.filter((k, p) -> p.second.equals(NULL)).mapValues(p -> p.first);
     }
   }
 
@@ -952,7 +958,7 @@ public class Aggregate {
   }
 
   private CompletionStage<Boolean> updateMongoAggregate(final JsonObject aggregate) {
-    return update(aggregate, environment, database).thenApply(result -> must(result, r -> r));
+    return update(aggregateCollection, aggregate).thenApply(result -> must(result, r -> r));
   }
 
   /**
@@ -1053,8 +1059,7 @@ public class Aggregate {
    * @since 1.0
    */
   public Aggregate withMongoDatabase(final MongoDatabase database) {
-    this.database =
-        database.withReadConcern(ReadConcern.MAJORITY).withWriteConcern(WriteConcern.MAJORITY);
+    this.database = database.withReadConcern(ReadConcern.LINEARIZABLE).withWriteConcern(MAJORITY);
 
     return this;
   }
