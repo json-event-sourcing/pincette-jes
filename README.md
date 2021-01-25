@@ -23,6 +23,7 @@
 - [Using JSLT](#using-jslt)
 - [Troubleshooting](#troubleshooting)
 - [API Documentation](#api-documentation)
+- [MongoDB](#mongodb)
 - [The Artifact](#the-artifact)
 - [The Maven Archetype](#the-maven-archetype)
 
@@ -96,6 +97,8 @@ A command is a JSON document, which has the following technical fields on top of
 |\_jwt|The decoded JSON Web Token.|No|
 |\_languages|An array of language tags in the order of preference. When a validator or some other component wishes to send messages to the user, it can use the proper language for it.|No|
 |\_type|The aggregate type, which is composed as ```<application>-<name>```.|Yes|
+
+There are three built-in commands called ```put```, ```patch``` and ```delete```. The ```put``` command replaces the entire contents of the aggregate instance. The ```patch``` command has the array field ```_ops```, which is a [JSON patch](https://tools.ietf.org/html/rfc6902) that is applied to the instance. The ```delete``` command performs a logical delete. It sets the field ```_deleted``` to ```true```. The reducers for these commands can be replaced.
 
 ## Events
 
@@ -476,6 +479,10 @@ Sometimes you will need a debugger, but hopefully not on production. For debuggi
 ## API Documentation
 
 See [javadoc](https://www.javadoc.io/doc/net.pincette/pincette-jes/latest/index.html).
+
+## MongoDB
+
+You need at least MongoDB 4.2 to work with this library.
 
 ## The Artifact
 

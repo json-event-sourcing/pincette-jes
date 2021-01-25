@@ -1,9 +1,12 @@
 package net.pincette.jes;
 
 import static com.mongodb.WriteConcern.MAJORITY;
+import static com.mongodb.client.model.Aggregates.match;
+import static com.mongodb.client.model.Aggregates.project;
 import static com.mongodb.client.model.Filters.and;
 import static com.mongodb.client.model.Filters.eq;
 import static com.mongodb.client.model.Filters.regex;
+import static com.mongodb.client.model.Projections.include;
 import static java.lang.Boolean.FALSE;
 import static java.lang.String.valueOf;
 import static java.time.Duration.ofSeconds;
@@ -37,6 +40,7 @@ import static net.pincette.jes.util.JsonFields.TIMESTAMP;
 import static net.pincette.jes.util.JsonFields.TYPE;
 import static net.pincette.jes.util.Mongo.addNotDeleted;
 import static net.pincette.jes.util.Mongo.restore;
+import static net.pincette.jes.util.Mongo.updateAggregate;
 import static net.pincette.jes.util.Streams.duplicateFilter;
 import static net.pincette.json.JsonUtil.createArrayBuilder;
 import static net.pincette.json.JsonUtil.createDiff;
@@ -49,13 +53,14 @@ import static net.pincette.json.JsonUtil.string;
 import static net.pincette.mongo.BsonUtil.fromJson;
 import static net.pincette.mongo.Collection.deleteOne;
 import static net.pincette.mongo.Expression.function;
-import static net.pincette.mongo.JsonClient.find;
+import static net.pincette.mongo.JsonClient.aggregate;
 import static net.pincette.mongo.JsonClient.findOne;
 import static net.pincette.mongo.JsonClient.insert;
 import static net.pincette.mongo.JsonClient.update;
 import static net.pincette.util.Builder.create;
 import static net.pincette.util.Collections.list;
 import static net.pincette.util.Collections.set;
+import static net.pincette.util.Or.tryWith;
 import static net.pincette.util.Pair.pair;
 import static net.pincette.util.Util.getStackTrace;
 import static net.pincette.util.Util.must;
@@ -226,6 +231,7 @@ public class Aggregate {
   private StreamProcessor commandProcessor;
   private KStream<String, JsonObject> commands;
   private MongoDatabase database;
+  private MongoDatabase databaseArchive;
   private String environment = "dev";
   private MongoCollection<Document> eventCollection;
   private KStream<String, JsonObject> events;
@@ -637,6 +643,12 @@ public class Aggregate {
         .thenApply(result -> true);
   }
 
+  private Optional<CompletionStage<Boolean>> deleteReduction(final JsonObject reduction) {
+    return getBoolean(reduction, "/" + AFTER + "/" + DELETED)
+        .filter(deleted -> deleted)
+        .map(deleted -> deleteMongoAggregate(reduction.getJsonObject(AFTER)));
+  }
+
   /**
    * Returns the environment.
    *
@@ -695,22 +707,38 @@ public class Aggregate {
     return app + "-" + type;
   }
 
-  private CompletionStage<JsonObject> getCurrentState(final JsonObject command) {
+  private CompletionStage<Pair<JsonObject, Boolean>> getCurrentState(final JsonObject command) {
     return aggregateCache
         .get(cacheKey(command))
-        .map(currentState -> (CompletionStage<JsonObject>) completedFuture(currentState))
-        .orElseGet(
-            () ->
-                getMongoCurrentState(command)
-                    .thenComposeAsync(
-                        currentState ->
-                            currentState
-                                .map(state -> (CompletionStage<JsonObject>) completedFuture(state))
-                                .orElseGet(() -> restoreFromCommand(command))));
+        .map(
+            currentState ->
+                (CompletionStage<Pair<JsonObject, Boolean>>)
+                    completedFuture(pair(currentState, false)))
+        .orElseGet(() -> getMongoCurrentState(command));
   }
 
-  private CompletionStage<Optional<JsonObject>> getMongoCurrentState(final JsonObject command) {
-    return findOne(aggregateCollection, mongoStateCriterion(command));
+  private CompletionStage<Pair<JsonObject, Boolean>> getMongoCurrentState(
+      final JsonObject command) {
+    return findOne(aggregateCollection, mongoStateCriterion(command))
+        .thenComposeAsync(
+            currentState ->
+                currentState
+                    .map(
+                        state ->
+                            (CompletionStage<Pair<JsonObject, Boolean>>)
+                                completedFuture(pair(state, false)))
+                    .orElseGet(
+                        () -> restoreFromCommand(command).thenApply(state -> pair(state, true))));
+  }
+
+  private CompletionStage<JsonObject> handleAggregate(
+      final JsonObject reduction, final boolean reconstructed) {
+    return tryWith(() -> deleteReduction(reduction).orElse(null))
+        .or(() -> updateReductionNew(reduction, reconstructed).orElse(null))
+        .or(() -> updateReductionExisting(reduction, reconstructed).orElse(null))
+        .get()
+        .map(result -> result.thenApply(res -> must(res, r -> r)).thenApply(res -> reduction))
+        .orElseGet(() -> completedFuture(reduction));
   }
 
   private CompletionStage<Boolean> insertMongoEvent(final JsonObject event) {
@@ -719,12 +747,15 @@ public class Aggregate {
   }
 
   private CompletionStage<Boolean> isDuplicate(final JsonObject command) {
-    return find(
+    return aggregate(
             eventCollection,
-            and(
-                regex(ID, "^" + command.getString(ID) + ".*"),
-                eq(CORR, command.getString(CORR)),
-                eq(COMMAND, command.getString(COMMAND))))
+            list(
+                match(
+                    and(
+                        regex(ID, "^" + command.getString(ID) + ".*"),
+                        eq(CORR, command.getString(CORR)),
+                        eq(COMMAND, command.getString(COMMAND)))),
+                project(include(ID))))
         .thenApply(result -> !result.isEmpty());
   }
 
@@ -833,6 +864,13 @@ public class Aggregate {
     }
   }
 
+  private CompletionStage<JsonObject> processCommand(final JsonObject command) {
+    return reduceCommand(command)
+        .thenComposeAsync(
+            pair ->
+                saveReduction(pair.first, reduction -> handleAggregate(reduction, pair.second)));
+  }
+
   private JsonObject processNewState(
       final JsonObject oldState, final JsonObject newState, final JsonObject command) {
     return Optional.ofNullable(newState)
@@ -854,24 +892,24 @@ public class Aggregate {
                 isDuplicate(command)
                     .thenComposeAsync(
                         result ->
-                            FALSE.equals(result)
-                                ? reduceCommand(command).thenComposeAsync(this::saveReduction)
-                                : completedFuture(null))
+                            FALSE.equals(result) ? processCommand(command) : completedFuture(null))
                     .toCompletableFuture()
                     .get(),
             e -> setException(command, e))
         .orElse(null);
   }
 
-  private CompletionStage<JsonObject> reduceCommand(final JsonObject command) {
+  private CompletionStage<Pair<JsonObject, Boolean>> reduceCommand(final JsonObject command) {
     final JsonObject checked = checkUnique(command);
 
     return hasError(checked)
-        ? completedFuture(checked)
+        ? completedFuture(pair(checked, false))
         : getCurrentState(command)
-            .thenApply(currentState -> makeManaged(currentState, command))
+            .thenApply(pair -> pair(makeManaged(pair.first, command), pair.second))
             .thenComposeAsync(
-                currentState -> reduceIfAllowed(currentState, keepId(currentState, command)));
+                pair ->
+                    reduceIfAllowed(pair.first, keepId(pair.first, command))
+                        .thenApply(newState -> pair(newState, pair.second)));
   }
 
   private CompletionStage<JsonObject> reduceIfAllowed(
@@ -904,17 +942,15 @@ public class Aggregate {
   }
 
   private CompletionStage<JsonObject> restoreFromCommand(final JsonObject command) {
-    return restore(command.getString(ID), fullType(), environment, database);
+    return restore(command.getString(ID), fullType(), environment, databaseArchive);
   }
 
-  private CompletionStage<JsonObject> saveReduction(final JsonObject reduction) {
-    final Function<JsonObject, CompletionStage<Boolean>> handleAggregate =
-        a -> a.getBoolean(DELETED, false) ? deleteMongoAggregate(a) : updateMongoAggregate(a);
-
+  private CompletionStage<JsonObject> saveReduction(
+      final JsonObject reduction,
+      final Function<JsonObject, CompletionStage<JsonObject>> handleAggregate) {
     return isEvent(reduction)
         ? insertMongoEvent(plainEvent(reduction))
-            .thenComposeAsync(result -> handleAggregate.apply(reduction.getJsonObject(AFTER)))
-            .thenApply(result -> reduction)
+            .thenComposeAsync(result -> handleAggregate.apply(reduction))
             .exceptionally(
                 e -> {
                   deleteMongoEvent(reduction);
@@ -959,6 +995,22 @@ public class Aggregate {
 
   private CompletionStage<Boolean> updateMongoAggregate(final JsonObject aggregate) {
     return update(aggregateCollection, aggregate).thenApply(result -> must(result, r -> r));
+  }
+
+  private Optional<CompletionStage<Boolean>> updateReductionNew(
+      final JsonObject reduction, final boolean reconstructed) {
+    return Optional.of(reduction.getJsonObject(BEFORE))
+        .filter(before -> reconstructed)
+        .map(before -> updateMongoAggregate(reduction.getJsonObject(AFTER)));
+  }
+
+  private Optional<CompletionStage<Boolean>> updateReductionExisting(
+      final JsonObject reduction, final boolean reconstructed) {
+    return Optional.of(reduction.getJsonObject(BEFORE))
+        .filter(before -> !reconstructed)
+        .map(
+            before ->
+                updateAggregate(aggregateCollection, reduction.getJsonObject(BEFORE), reduction));
   }
 
   /**
@@ -1060,6 +1112,25 @@ public class Aggregate {
    */
   public Aggregate withMongoDatabase(final MongoDatabase database) {
     this.database = database.withReadConcern(ReadConcern.LINEARIZABLE).withWriteConcern(MAJORITY);
+
+    if (this.databaseArchive == null) {
+      this.databaseArchive = database;
+    }
+
+    return this;
+  }
+
+  /**
+   * The MongoDB archive database that is used to reconstruct aggregate instances from the event
+   * log. This is for the MongoDB Atlas Online Archive feature. It may be <code>null</code>, in
+   * which case the regular database connection will be used.
+   *
+   * @param database the database connection.
+   * @return The aggregate object itself.
+   * @since 1.2.5
+   */
+  public Aggregate withMongoDatabaseArchive(final MongoDatabase database) {
+    this.databaseArchive = database != null ? database : this.database;
 
     return this;
   }
