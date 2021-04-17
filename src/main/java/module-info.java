@@ -10,5 +10,6 @@ module net.pincette.jes {
   requires net.pincette.rs;
   requires org.mongodb.driver.reactivestreams;
   requires org.mongodb.bson;
+  requires java.logging;
   exports net.pincette.jes;
 }

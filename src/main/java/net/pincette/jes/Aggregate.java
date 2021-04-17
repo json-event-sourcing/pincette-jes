@@ -15,6 +15,7 @@ import static java.util.Arrays.fill;
 import static java.util.Arrays.stream;
 import static java.util.Optional.ofNullable;
 import static java.util.concurrent.CompletableFuture.completedFuture;
+import static java.util.logging.Level.SEVERE;
 import static javax.json.JsonValue.NULL;
 import static net.pincette.jes.util.Command.hasError;
 import static net.pincette.jes.util.Command.isAllowed;
@@ -79,7 +80,10 @@ import java.util.Set;
 import java.util.concurrent.CompletionStage;
 import java.util.function.BinaryOperator;
 import java.util.function.Function;
+import java.util.function.Predicate;
+import java.util.function.Supplier;
 import java.util.function.UnaryOperator;
+import java.util.logging.Logger;
 import javax.json.JsonArray;
 import javax.json.JsonNumber;
 import javax.json.JsonObject;
@@ -236,6 +240,7 @@ public class Aggregate {
   private MongoCollection<Document> eventCollection;
   private KStream<String, JsonObject> events;
   private KStream<String, JsonObject> eventsFull;
+  private Logger logger;
   private KStream<String, JsonObject> monitor;
   private boolean monitoring;
   private Reducer reducer;
@@ -632,12 +637,16 @@ public class Aggregate {
   }
 
   private CompletionStage<Boolean> deleteMongoAggregate(final JsonObject aggregate) {
+    trace(aggregate, a -> true, () -> "Deleting aggregate " + string(aggregate));
+
     return deleteOne(aggregateCollection, eq(ID, aggregate.getString(ID)))
         .thenApply(result -> must(result, DeleteResult::wasAcknowledged))
         .thenApply(result -> true);
   }
 
   private CompletionStage<Boolean> deleteMongoEvent(final JsonObject event) {
+    trace(event, e -> true, () -> "Deleting event " + string(event));
+
     return deleteOne(eventCollection, eq(ID, mongoEventKey(event)))
         .thenApply(result -> must(result, DeleteResult::wasAcknowledged))
         .thenApply(result -> true);
@@ -742,6 +751,8 @@ public class Aggregate {
   }
 
   private CompletionStage<Boolean> insertMongoEvent(final JsonObject event) {
+    trace(event, e -> true, () -> "Inserting event " + string(event));
+
     return insert(eventCollection, setId(event, mongoEventKey(event)))
         .thenApply(result -> must(result, r -> r));
   }
@@ -756,6 +767,9 @@ public class Aggregate {
                         eq(CORR, command.getString(CORR)),
                         eq(COMMAND, command.getString(COMMAND)))),
                 project(include(ID))))
+        .thenApply(
+            result ->
+                trace(result, r -> !r.isEmpty(), () -> "Duplicate command " + string(command)))
         .thenApply(result -> !result.isEmpty());
   }
 
@@ -763,6 +777,12 @@ public class Aggregate {
     return uniqueFunction != null
         ? createObjectBuilder(command).add(ID, currentState.getString(ID)).build()
         : command;
+  }
+
+  private void logException(final Throwable e) {
+    if (logger != null) {
+      logger.log(SEVERE, e.getMessage(), e);
+    }
   }
 
   /**
@@ -895,7 +915,9 @@ public class Aggregate {
                             FALSE.equals(result) ? processCommand(command) : completedFuture(null))
                     .toCompletableFuture()
                     .get(),
-            e -> setException(command, e))
+            e ->
+                SideEffect.<JsonObject>run(() -> logException(e))
+                    .andThenGet(() -> setException(command, e)))
         .orElse(null);
   }
 
@@ -921,7 +943,16 @@ public class Aggregate {
   }
 
   private KStream<String, JsonObject> reducer() {
-    return commandSource().mapValues(this::reduce).filter((k, v) -> v != null);
+    return commandSource()
+        .mapValues(json -> trace(json, j -> true, () -> "Reducing " + string(json)))
+        .mapValues(this::reduce)
+        .mapValues(
+            json ->
+                trace(
+                    json,
+                    j -> true,
+                    () -> "Reduction result: " + (json != null ? string(json) : "null")))
+        .filter((k, v) -> v != null);
   }
 
   /**
@@ -971,6 +1002,14 @@ public class Aggregate {
     return fullType() + "-" + purpose + "-" + environment;
   }
 
+  private <T> T trace(final T value, final Predicate<T> test, final Supplier<String> message) {
+    if (logger != null && test.test(value)) {
+      logger.finest(message);
+    }
+
+    return value;
+  }
+
   private void unique() {
     if (uniqueFunction != null) {
       final KStream<String, Pair<JsonObject, JsonValue>> applied =
@@ -994,6 +1033,8 @@ public class Aggregate {
   }
 
   private CompletionStage<Boolean> updateMongoAggregate(final JsonObject aggregate) {
+    trace(aggregate, a -> true, () -> "Replacing aggregate " + string(aggregate));
+
     return update(aggregateCollection, aggregate).thenApply(result -> must(result, r -> r));
   }
 
@@ -1008,6 +1049,12 @@ public class Aggregate {
       final JsonObject reduction, final boolean reconstructed) {
     return Optional.of(reduction.getJsonObject(BEFORE))
         .filter(before -> !reconstructed)
+        .map(
+            before ->
+                trace(
+                    before,
+                    b -> true,
+                    () -> "Updating aggregate " + string(reduction.getJsonObject(AFTER))))
         .map(
             before ->
                 updateAggregate(aggregateCollection, reduction.getJsonObject(BEFORE), reduction));
@@ -1098,6 +1145,19 @@ public class Aggregate {
    */
   public Aggregate withEnvironment(final String environment) {
     this.environment = environment;
+
+    return this;
+  }
+
+  /**
+   * Sets the logger, which will be used when the log level is <code>FINEST</code>.
+   *
+   * @param logger the logger.
+   * @return The aggregate object itself.
+   * @since 1.3
+   */
+  public Aggregate withLogger(final Logger logger) {
+    this.logger = logger;
 
     return this;
   }
