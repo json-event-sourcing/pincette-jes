@@ -981,13 +981,16 @@ public class Aggregate {
       final Function<JsonObject, CompletionStage<JsonObject>> handleAggregate) {
     return isEvent(reduction)
         ? insertMongoEvent(plainEvent(reduction))
-            .thenComposeAsync(result -> handleAggregate.apply(reduction))
-            .exceptionally(
-                e -> {
-                  deleteMongoEvent(reduction);
-                  rethrow(e);
-                  return null;
-                })
+            .thenComposeAsync(
+                result ->
+                    handleAggregate
+                        .apply(reduction)
+                        .exceptionally(
+                            e -> {
+                              deleteMongoEvent(reduction);
+                              rethrow(e);
+                              return null;
+                            }))
         : completedFuture(reduction);
   }
 
