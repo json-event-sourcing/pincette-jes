@@ -1,0 +1,14 @@
+{
+  "_id": "f3b43ce3-f435-4504-863d-409a6536108d",
+  "_corr": "a8fe8064-24dc-4562-8883-02f3778e3628",
+  "_type": "test-test",
+  "_command": "put",
+  "_jwt": {
+    "sub": "good",
+    "roles": [
+      "test"
+    ]
+  },
+  "value": 0,
+  "unique": 0
+}

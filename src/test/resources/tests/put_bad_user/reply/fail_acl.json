@@ -1,0 +1,17 @@
+{
+  "_id": "ebb689bd-3038-4f31-88cd-ad2baa40ae9a",
+  "_corr": "a8fe8064-24dc-4562-8883-02f3778e3628",
+  "_type": "test-test",
+  "_command": "put",
+  "_jwt": {
+    "sub": "bad",
+    "roles": [
+      "test2"
+    ]
+  },
+  "value": 0,
+  "unique": 0,
+  "_error": true,
+  "_statusCode": 403,
+  "message": "Forbidden"
+}

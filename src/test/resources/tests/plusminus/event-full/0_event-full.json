@@ -1,0 +1,57 @@
+{
+  "_id": "ebb689bd-3038-4f31-88cd-ad2baa40ae9a",
+  "_corr": "5c60b438-7ba1-4358-97d9-3510cb251ff9",
+  "_type": "test-test",
+  "_command": "put",
+  "_jwt": {
+    "sub": "system"
+  },
+  "_seq": 0,
+  "_ops": [
+    {
+      "op": "add",
+      "path": "/value",
+      "value": 0
+    },
+    {
+      "op": "add",
+      "path": "/unique",
+      "value": 0
+    },
+    {
+      "op": "add",
+      "path": "/_acl",
+      "value": {
+        "get": [
+          "test"
+        ],
+        "write": [
+          "test"
+        ]
+      }
+    }
+  ],
+  "_before": {
+    "_id": "ebb689bd-3038-4f31-88cd-ad2baa40ae9a",
+    "_type": "test-test"
+  },
+  "_after": {
+    "_id": "ebb689bd-3038-4f31-88cd-ad2baa40ae9a",
+    "_corr": "5c60b438-7ba1-4358-97d9-3510cb251ff9",
+    "_type": "test-test",
+    "_seq": 0,
+    "_jwt": {
+      "sub": "system"
+    },
+    "_acl": {
+      "get": [
+        "test"
+      ],
+      "write": [
+        "test"
+      ]
+    },
+    "value": 0,
+    "unique": 0
+  }
+}

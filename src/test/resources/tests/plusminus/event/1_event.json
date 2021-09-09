@@ -1,0 +1,17 @@
+{
+  "_id": "ebb689bd-3038-4f31-88cd-ad2baa40ae9a",
+  "_corr": "db945e0e-4cf3-495b-b246-3d72f9cc5863",
+  "_type": "test-test",
+  "_command": "plus",
+  "_jwt": {
+    "sub": "system"
+  },
+  "_seq": 1,
+  "_ops": [
+    {
+      "op": "replace",
+      "path": "/value",
+      "value": 1
+    }
+  ]
+}

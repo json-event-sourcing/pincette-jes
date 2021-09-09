@@ -1,0 +1,19 @@
+{
+  "_id": "ebb689bd-3038-4f31-88cd-ad2baa40ae9a",
+  "_corr": "8cfcd64b-22e6-40b3-a2f2-675514c94284",
+  "_type": "test-test",
+  "_seq": 2,
+  "_jwt": {
+    "sub": "system"
+  },
+  "_acl": {
+    "get": [
+      "test"
+    ],
+    "write": [
+      "test"
+    ]
+  },
+  "value": 0,
+  "unique": 0
+}

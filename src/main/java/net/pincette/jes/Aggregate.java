@@ -5,13 +5,10 @@ import static com.mongodb.client.model.Aggregates.match;
 import static com.mongodb.client.model.Aggregates.project;
 import static com.mongodb.client.model.Filters.and;
 import static com.mongodb.client.model.Filters.eq;
-import static com.mongodb.client.model.Filters.regex;
 import static com.mongodb.client.model.Projections.include;
 import static java.lang.Boolean.FALSE;
-import static java.lang.String.valueOf;
 import static java.time.Duration.ofSeconds;
 import static java.time.Instant.now;
-import static java.util.Arrays.fill;
 import static java.util.Arrays.stream;
 import static java.util.Optional.ofNullable;
 import static java.util.concurrent.CompletableFuture.completedFuture;
@@ -40,36 +37,40 @@ import static net.pincette.jes.util.JsonFields.TEST;
 import static net.pincette.jes.util.JsonFields.TIMESTAMP;
 import static net.pincette.jes.util.JsonFields.TYPE;
 import static net.pincette.jes.util.Mongo.addNotDeleted;
+import static net.pincette.jes.util.Mongo.eventToMongo;
 import static net.pincette.jes.util.Mongo.restore;
 import static net.pincette.jes.util.Mongo.updateAggregate;
+import static net.pincette.jes.util.Mongo.upgradeEventLog;
 import static net.pincette.jes.util.Streams.duplicateFilter;
 import static net.pincette.json.JsonUtil.createArrayBuilder;
 import static net.pincette.json.JsonUtil.createDiff;
 import static net.pincette.json.JsonUtil.createObjectBuilder;
 import static net.pincette.json.JsonUtil.createPatch;
+import static net.pincette.json.JsonUtil.emptyObject;
 import static net.pincette.json.JsonUtil.getBoolean;
 import static net.pincette.json.JsonUtil.getString;
 import static net.pincette.json.JsonUtil.isObject;
 import static net.pincette.json.JsonUtil.string;
 import static net.pincette.mongo.BsonUtil.fromJson;
 import static net.pincette.mongo.Collection.deleteOne;
+import static net.pincette.mongo.Collection.insertOne;
 import static net.pincette.mongo.Expression.function;
 import static net.pincette.mongo.JsonClient.aggregate;
 import static net.pincette.mongo.JsonClient.findOne;
-import static net.pincette.mongo.JsonClient.insert;
 import static net.pincette.mongo.JsonClient.update;
+import static net.pincette.mongo.Session.inTransaction;
 import static net.pincette.util.Builder.create;
 import static net.pincette.util.Collections.list;
 import static net.pincette.util.Collections.set;
 import static net.pincette.util.Or.tryWith;
 import static net.pincette.util.Pair.pair;
-import static net.pincette.util.Util.getStackTrace;
 import static net.pincette.util.Util.must;
-import static net.pincette.util.Util.rethrow;
-import static net.pincette.util.Util.tryToGet;
+import static net.pincette.util.Util.tryToGetForever;
 
 import com.mongodb.ReadConcern;
 import com.mongodb.client.result.DeleteResult;
+import com.mongodb.client.result.InsertOneResult;
+import com.mongodb.reactivestreams.client.ClientSession;
 import com.mongodb.reactivestreams.client.MongoCollection;
 import com.mongodb.reactivestreams.client.MongoDatabase;
 import java.time.Duration;
@@ -89,15 +90,14 @@ import javax.json.JsonNumber;
 import javax.json.JsonObject;
 import javax.json.JsonObjectBuilder;
 import javax.json.JsonValue;
-import net.pincette.function.SideEffect;
 import net.pincette.jes.util.AuditFields;
 import net.pincette.jes.util.Reducer;
-import net.pincette.json.JsonUtil;
 import net.pincette.util.Pair;
 import net.pincette.util.TimedCache;
 import org.apache.kafka.streams.KeyValue;
 import org.apache.kafka.streams.StreamsBuilder;
 import org.apache.kafka.streams.kstream.KStream;
+import org.bson.BsonDocument;
 import org.bson.Document;
 import org.bson.conversions.Bson;
 
@@ -209,18 +209,13 @@ public class Aggregate {
   private static final String AGGREGATE_TOPIC = "aggregate";
   private static final String COMMAND_TOPIC = "command";
   private static final Duration DUPLICATE_WINDOW = ofSeconds(60);
+  private static final String EVENT_ID = "id";
   private static final String EVENT_TOPIC = "event";
   private static final String EVENT_FULL_TOPIC = "event-full";
-  private static final String EXCEPTION = "exception";
   private static final String MONITOR_TOPIC = "monitor";
   private static final String REDUCER_COMMAND = "command";
   private static final String REDUCER_STATE = "state";
   private static final String REPLY_TOPIC = "reply";
-  private static final String STEP = "step";
-  private static final String STEP_AFTER = "after";
-  private static final String STEP_COMMAND = "command";
-  private static final String STEP_ERROR = "error";
-  private static final String STEP_TIMESTAMP = "timestamp";
   private static final Set<String> TECHNICAL_FIELDS =
       set(COMMAND, CORR, ID, JWT, LANGUAGES, SEQ, TEST, TIMESTAMP, TYPE);
   private static final String UNIQUE_TOPIC = "unique";
@@ -232,17 +227,18 @@ public class Aggregate {
   private String app;
   private boolean breakingTheGlass;
   private StreamsBuilder builder;
+  private ClientSession clientSession;
   private StreamProcessor commandProcessor;
   private KStream<String, JsonObject> commands;
   private MongoDatabase database;
   private MongoDatabase databaseArchive;
   private String environment = "dev";
   private MongoCollection<Document> eventCollection;
+  private MongoCollection<BsonDocument> eventCollectionBson;
   private KStream<String, JsonObject> events;
   private KStream<String, JsonObject> eventsFull;
   private Logger logger;
   private KStream<String, JsonObject> monitor;
-  private boolean monitoring;
   private Reducer reducer;
   private KStream<String, JsonObject> replies;
   private String type;
@@ -309,14 +305,6 @@ public class Aggregate {
         .build();
   }
 
-  private static JsonObject createError(final JsonObject command, final long timestamp) {
-    return createObjectBuilder()
-        .add(STEP, STEP_ERROR)
-        .add(STEP_COMMAND, command)
-        .add(STEP_TIMESTAMP, timestamp)
-        .build();
-  }
-
   private static JsonObject createEvent(
       final JsonObject oldState,
       final JsonObject newState,
@@ -357,22 +345,6 @@ public class Aggregate {
     return createObjectBuilder().add(REDUCER_STATE, state).add(REDUCER_COMMAND, command).build();
   }
 
-  private static JsonObject createStep(
-      final String step, final String after, final long timestamp) {
-    return createStep(step, after, timestamp, null);
-  }
-
-  private static JsonObject createStep(
-      final String step, final String after, final long timestamp, final String command) {
-    return create(JsonUtil::createObjectBuilder)
-        .update(b -> b.add(STEP, step))
-        .update(b -> b.add(STEP_TIMESTAMP, timestamp))
-        .updateIf(b -> after != null, b -> b.add(STEP_AFTER, after))
-        .updateIf(b -> command != null, b -> b.add(STEP_COMMAND, command))
-        .build()
-        .build();
-  }
-
   /**
    * The standard delete reducer. It sets the field <code>_deleted</code> to <code>true</code>.
    *
@@ -388,10 +360,6 @@ public class Aggregate {
     return reducer.filter((k, v) -> isCommand(v) && hasError(v));
   }
 
-  private static String generateSeq(final long value) {
-    return pad(valueOf(value), '0', 12);
-  }
-
   private static JsonObject idsToLowerCase(final JsonObject json) {
     return createObjectBuilder(json)
         .add(ID, json.getString(ID).toLowerCase())
@@ -405,26 +373,6 @@ public class Aggregate {
         .updateIf(b -> !state.containsKey(TYPE), b -> b.add(TYPE, command.getString(TYPE)))
         .build()
         .build();
-  }
-
-  private static String mongoEventKey(final JsonObject json) {
-    return mongoEventKey(json, json.getJsonNumber(SEQ).longValue());
-  }
-
-  private static String mongoEventKey(final JsonObject json, final long seq) {
-    return json.getString(ID) + "-" + generateSeq(seq);
-  }
-
-  private static String pad(final String s, final char c, final int size) {
-    return s.length() >= size ? s : (new String(pad(c, size - s.length())) + s);
-  }
-
-  private static char[] pad(final char c, final int size) {
-    final char[] result = new char[size];
-
-    fill(result, c);
-
-    return result;
   }
 
   /**
@@ -494,14 +442,6 @@ public class Aggregate {
         .reduce(createObjectBuilder(json), JsonObjectBuilder::remove, (b1, b2) -> b1);
   }
 
-  private static JsonObject setException(final JsonObject command, final Exception e) {
-    return createObjectBuilder(command).add(ERROR, true).add(EXCEPTION, getStackTrace(e)).build();
-  }
-
-  private static JsonObject setId(final JsonObject json, final String id) {
-    return createObjectBuilder(json).add(ID, id).build();
-  }
-
   private static JsonObject uniqueError(final JsonObject command) {
     return createObjectBuilder(command)
         .add(ERROR, true)
@@ -564,14 +504,19 @@ public class Aggregate {
    * @since 1.0
    */
   public StreamsBuilder build() {
-    assert app != null
-        && builder != null
-        && environment != null
-        && type != null
-        && database != null;
+    if (app == null
+        || builder == null
+        || environment == null
+        || type == null
+        || database == null
+        || clientSession == null) {
+      throw new IllegalArgumentException();
+    }
 
+    upgradeEventLog(fullType(), environment, database, clientSession, logger);
     aggregateCollection = database.getCollection(mongoAggregateCollection());
     eventCollection = database.getCollection(mongoEventCollection());
+    eventCollectionBson = database.getCollection(mongoEventCollection(), BsonDocument.class);
     commands = createCommands();
     unique();
 
@@ -580,11 +525,6 @@ public class Aggregate {
     aggregates(red);
     replies(red);
     events(red);
-    monitorTopic(aggregates, AGGREGATE_TOPIC);
-    monitorTopic(events, EVENT_TOPIC);
-    monitorTopic(replies, REPLY_TOPIC);
-    monitorTopic(eventsFull, EVENT_FULL_TOPIC);
-    monitorReducer(red);
     audit();
 
     return builder;
@@ -629,8 +569,6 @@ public class Aggregate {
             (k, v) -> commandDuplicateKey(v),
             ofSeconds(60));
 
-    monitorCommands(commandFilter);
-
     return (commandProcessor != null
         ? commandProcessor.apply(commandFilter, builder)
         : commandFilter);
@@ -639,17 +577,9 @@ public class Aggregate {
   private CompletionStage<Boolean> deleteMongoAggregate(final JsonObject aggregate) {
     trace(aggregate, a -> true, () -> "Deleting aggregate " + string(aggregate));
 
-    return deleteOne(aggregateCollection, eq(ID, aggregate.getString(ID)))
-        .thenApply(result -> must(result, DeleteResult::wasAcknowledged))
-        .thenApply(result -> true);
-  }
-
-  private CompletionStage<Boolean> deleteMongoEvent(final JsonObject event) {
-    trace(event, e -> true, () -> "Deleting event " + string(event));
-
-    return deleteOne(eventCollection, eq(ID, mongoEventKey(event)))
-        .thenApply(result -> must(result, DeleteResult::wasAcknowledged))
-        .thenApply(result -> true);
+    return deleteOne(aggregateCollection, clientSession, eq(ID, aggregate.getString(ID)))
+        .thenApply(DeleteResult::wasAcknowledged)
+        .thenApply(result -> must(result, r -> r));
   }
 
   private Optional<CompletionStage<Boolean>> deleteReduction(final JsonObject reduction) {
@@ -753,7 +683,8 @@ public class Aggregate {
   private CompletionStage<Boolean> insertMongoEvent(final JsonObject event) {
     trace(event, e -> true, () -> "Inserting event " + string(event));
 
-    return insert(eventCollection, setId(event, mongoEventKey(event)))
+    return insertOne(eventCollectionBson, clientSession, eventToMongo(event))
+        .thenApply(InsertOneResult::wasAcknowledged)
         .thenApply(result -> must(result, r -> r));
   }
 
@@ -763,7 +694,7 @@ public class Aggregate {
             list(
                 match(
                     and(
-                        regex(ID, "^" + command.getString(ID) + ".*"),
+                        eq(ID + "." + EVENT_ID, command.getString(ID)),
                         eq(CORR, command.getString(CORR)),
                         eq(COMMAND, command.getString(COMMAND)))),
                 project(include(ID))))
@@ -827,68 +758,22 @@ public class Aggregate {
                     .build()));
   }
 
-  private void monitorCommands(final KStream<String, JsonObject> commands) {
-    if (monitoring) {
-      commands
-          .filter((k, v) -> v.containsKey(CORR))
-          .flatMap(
-              (k, v) ->
-                  list(
-                      new KeyValue<>(
-                          v.getString(CORR),
-                          createStep(
-                              MonitorSteps.RECEIVED,
-                              null,
-                              v.getJsonNumber(TIMESTAMP).longValue(),
-                              v.getString(COMMAND))),
-                      new KeyValue<>(
-                          v.getString(CORR),
-                          createStep(
-                              MonitorSteps.COMMAND_TOPIC,
-                              MonitorSteps.RECEIVED,
-                              now().toEpochMilli(),
-                              v.getString(COMMAND)))))
-          .to(topic(MONITOR_TOPIC));
-    }
-  }
-
-  private void monitorReducer(final KStream<String, JsonObject> reducer) {
-    if (monitoring) {
-      reducer
-          .filter((k, v) -> v.containsKey(CORR) && !hasError(v))
-          .map(
-              (k, v) ->
-                  new KeyValue<>(
-                      v.getString(CORR),
-                      createStep(
-                          MonitorSteps.REDUCE, MonitorSteps.COMMAND_TOPIC, now().toEpochMilli())))
-          .to(topic(MONITOR_TOPIC));
-
-      reducer
-          .filter((k, v) -> v.containsKey(CORR) && hasError(v))
-          .map((k, v) -> new KeyValue<>(v.getString(CORR), createError(v, now().toEpochMilli())))
-          .to(topic(MONITOR_TOPIC));
-    }
-  }
-
-  private void monitorTopic(final KStream<String, JsonObject> stream, final String name) {
-    if (monitoring) {
-      stream
-          .filter((k, v) -> v.containsKey(CORR))
-          .map(
-              (k, v) ->
-                  new KeyValue<>(
-                      v.getString(CORR),
-                      createStep(name + "-topic", MonitorSteps.REDUCE, now().toEpochMilli())))
-          .to(topic(MONITOR_TOPIC));
-    }
-  }
-
   private CompletionStage<JsonObject> processCommand(final JsonObject command) {
     return reduceCommand(command)
         .thenComposeAsync(
             pair ->
-                saveReduction(pair.first, reduction -> handleAggregate(reduction, pair.second)));
+                inTransaction(
+                        session ->
+                            saveReduction(
+                                pair.first, reduction -> handleAggregate(reduction, pair.second)),
+                        clientSession)
+                    .thenApply(
+                        result -> {
+                          if (isEvent(result)) {
+                            aggregateCache.put(cacheKey(command), result.getJsonObject(AFTER));
+                          }
+                          return result;
+                        }));
   }
 
   private JsonObject processNewState(
@@ -898,27 +783,22 @@ public class Aggregate {
         .map(state -> createOps(oldState, newState))
         .filter(ops -> !ops.isEmpty())
         .map(ops -> createEvent(oldState, newState, command, ops))
-        .map(
-            event ->
-                SideEffect.<JsonObject>run(
-                        () -> aggregateCache.put(cacheKey(command), event.getJsonObject(AFTER)))
-                    .andThenGet(() -> event))
         .orElse(newState);
   }
 
   private JsonObject reduce(final JsonObject command) {
-    return tryToGet(
+    return tryToGetForever(
             () ->
                 isDuplicate(command)
                     .thenComposeAsync(
                         result ->
-                            FALSE.equals(result) ? processCommand(command) : completedFuture(null))
-                    .toCompletableFuture()
-                    .get(),
-            e ->
-                SideEffect.<JsonObject>run(() -> logException(e))
-                    .andThenGet(() -> setException(command, e)))
-        .orElse(null);
+                            FALSE.equals(result)
+                                ? processCommand(command)
+                                : completedFuture(emptyObject())),
+            ofSeconds(5),
+            this::logException)
+        .toCompletableFuture()
+        .join();
   }
 
   private CompletionStage<Pair<JsonObject, Boolean>> reduceCommand(final JsonObject command) {
@@ -931,7 +811,7 @@ public class Aggregate {
             .thenComposeAsync(
                 pair ->
                     reduceIfAllowed(pair.first, keepId(pair.first, command))
-                        .thenApply(newState -> pair(newState, pair.second)));
+                        .thenApply(reduction -> pair(reduction, pair.second)));
   }
 
   private CompletionStage<JsonObject> reduceIfAllowed(
@@ -952,7 +832,7 @@ public class Aggregate {
                     json,
                     j -> true,
                     () -> "Reduction result: " + (json != null ? string(json) : "null")))
-        .filter((k, v) -> v != null);
+        .filter((k, v) -> v != null && !v.isEmpty());
   }
 
   /**
@@ -973,7 +853,7 @@ public class Aggregate {
   }
 
   private CompletionStage<JsonObject> restoreFromCommand(final JsonObject command) {
-    return restore(command.getString(ID), fullType(), environment, databaseArchive);
+    return restore(command.getString(ID), fullType(), environment, databaseArchive, clientSession);
   }
 
   private CompletionStage<JsonObject> saveReduction(
@@ -981,16 +861,7 @@ public class Aggregate {
       final Function<JsonObject, CompletionStage<JsonObject>> handleAggregate) {
     return isEvent(reduction)
         ? insertMongoEvent(plainEvent(reduction))
-            .thenComposeAsync(
-                result ->
-                    handleAggregate
-                        .apply(reduction)
-                        .exceptionally(
-                            e -> {
-                              deleteMongoEvent(reduction);
-                              rethrow(e);
-                              return null;
-                            }))
+            .thenComposeAsync(result -> handleAggregate.apply(reduction))
         : completedFuture(reduction);
   }
 
@@ -1038,7 +909,8 @@ public class Aggregate {
   private CompletionStage<Boolean> updateMongoAggregate(final JsonObject aggregate) {
     trace(aggregate, a -> true, () -> "Replacing aggregate " + string(aggregate));
 
-    return update(aggregateCollection, aggregate).thenApply(result -> must(result, r -> r));
+    return update(aggregateCollection, aggregate, clientSession)
+        .thenApply(result -> must(result, r -> r));
   }
 
   private Optional<CompletionStage<Boolean>> updateReductionNew(
@@ -1060,7 +932,11 @@ public class Aggregate {
                     () -> "Updating aggregate " + string(reduction.getJsonObject(AFTER))))
         .map(
             before ->
-                updateAggregate(aggregateCollection, reduction.getJsonObject(BEFORE), reduction));
+                updateAggregate(
+                    aggregateCollection,
+                    reduction.getJsonObject(BEFORE),
+                    reduction,
+                    clientSession));
   }
 
   /**
@@ -1166,6 +1042,19 @@ public class Aggregate {
   }
 
   /**
+   * The MongoDB client session that is used for transactions. It is mandatory.
+   *
+   * @param clientSession the MongoDB client session.
+   * @return The aggregate object itself.
+   * @since 2.0.0
+   */
+  public Aggregate withMongoClientSession(final ClientSession clientSession) {
+    this.clientSession = clientSession;
+
+    return this;
+  }
+
+  /**
    * The MongoDB database in which the events and aggregates are written. The database will be used
    * with majority read and write concerns.
    *
@@ -1194,25 +1083,6 @@ public class Aggregate {
    */
   public Aggregate withMongoDatabaseArchive(final MongoDatabase database) {
     this.databaseArchive = database != null ? database : this.database;
-
-    return this;
-  }
-
-  /**
-   * Turns on monitoring. This publishes monitoring messages on the
-   * &lt;aggregate-type&gt;-monitor-&lt;environment&gt; topic. A message is in JSON and always
-   * contains the fields "step" and "timestamp". The former is defined in <code>MonitorSteps</code>.
-   * The latter is an epoch millis value. The optional field "after" contains the step that proceeds
-   * this one. The optional field "command" contains the name of a command. This is turned off by
-   * default.
-   *
-   * @param monitoring whether monitoring is desired or not.
-   * @return The aggregate object itself.
-   * @since 1.0
-   * @see MonitorSteps
-   */
-  public Aggregate withMonitoring(final boolean monitoring) {
-    this.monitoring = monitoring;
 
     return this;
   }
