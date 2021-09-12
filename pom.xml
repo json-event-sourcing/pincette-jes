@@ -76,7 +76,7 @@
     <dependency>
       <groupId>net.pincette</groupId>
       <artifactId>pincette-common</artifactId>
-      <version>1.9.2</version>
+      <version>1.9.3</version>
     </dependency>
     <dependency>
       <groupId>net.pincette</groupId>
@@ -171,9 +171,9 @@
           <links>
             <link>http://docs.oracle.com/javase/8/docs/api/</link>
             <link>https://www.javadoc.io/doc/net.pincette/pincette-jes-util/1.4.4/</link>
-            <link>https://www.javadoc.io/doc/net.pincette/pincette-common/1.8.1/</link>
-            <link>https://www.javadoc.io/doc/net.pincette/pincette-mongo/2.2/</link>
-            <link>https://www.javadoc.io/doc/net.pincette/pincette-json/1.5.1/</link>
+            <link>https://www.javadoc.io/doc/net.pincette/pincette-common/1.9.1/</link>
+            <link>https://www.javadoc.io/doc/net.pincette/pincette-mongo/2.2.2/</link>
+            <link>https://www.javadoc.io/doc/net.pincette/pincette-json/1.6/</link>
             <link>https://www.javadoc.io/doc/javax.json/javax.json-api/1.1.4/</link>
             <link>https://www.javadoc.io/doc/org.apache.kafka/kafka-streams/2.8.0/</link>
           </links>
