@@ -7,11 +7,13 @@ import static com.mongodb.client.model.Filters.and;
 import static com.mongodb.client.model.Filters.eq;
 import static com.mongodb.client.model.Projections.include;
 import static java.lang.Boolean.FALSE;
+import static java.lang.Boolean.TRUE;
 import static java.time.Duration.ofSeconds;
 import static java.time.Instant.now;
 import static java.util.Arrays.stream;
 import static java.util.Optional.ofNullable;
 import static java.util.concurrent.CompletableFuture.completedFuture;
+import static java.util.logging.Level.INFO;
 import static java.util.logging.Level.SEVERE;
 import static javax.json.JsonValue.NULL;
 import static net.pincette.jes.util.Command.hasError;
@@ -91,6 +93,7 @@ import javax.json.JsonObject;
 import javax.json.JsonObjectBuilder;
 import javax.json.JsonValue;
 import net.pincette.jes.util.AuditFields;
+import net.pincette.jes.util.Mongo.DbContext;
 import net.pincette.jes.util.Reducer;
 import net.pincette.util.Pair;
 import net.pincette.util.TimedCache;
@@ -225,6 +228,7 @@ public class Aggregate {
   private MongoCollection<Document> aggregateCollection;
   private KStream<String, JsonObject> aggregates;
   private String app;
+  private ClientSession archiveClientSession;
   private boolean breakingTheGlass;
   private StreamsBuilder builder;
   private ClientSession clientSession;
@@ -396,6 +400,10 @@ public class Aggregate {
     return createObjectBuilder(fullEvent).remove(AFTER).remove(BEFORE).build();
   }
 
+  private static MongoDatabase prepareDatabase(final MongoDatabase database) {
+    return database.withReadConcern(ReadConcern.LINEARIZABLE).withWriteConcern(MAJORITY);
+  }
+
   /**
    * The standard put reducer. It just removes the <code>_command</code> field and uses everything
    * else as the new state of the aggregate.
@@ -513,7 +521,15 @@ public class Aggregate {
       throw new IllegalArgumentException();
     }
 
-    upgradeEventLog(fullType(), environment, database, clientSession, logger);
+    if (databaseArchive == null) {
+      databaseArchive = database;
+    }
+
+    if (archiveClientSession == null) {
+      archiveClientSession = clientSession;
+    }
+
+    upgradeEvents();
     aggregateCollection = database.getCollection(mongoAggregateCollection());
     eventCollection = database.getCollection(mongoEventCollection());
     eventCollectionBson = database.getCollection(mongoEventCollection(), BsonDocument.class);
@@ -853,7 +869,12 @@ public class Aggregate {
   }
 
   private CompletionStage<JsonObject> restoreFromCommand(final JsonObject command) {
-    return restore(command.getString(ID), fullType(), environment, databaseArchive, clientSession);
+    return restore(
+        command.getString(ID),
+        fullType(),
+        environment,
+        new DbContext(database, clientSession),
+        new DbContext(databaseArchive, archiveClientSession));
   }
 
   private CompletionStage<JsonObject> saveReduction(
@@ -884,6 +905,16 @@ public class Aggregate {
     return value;
   }
 
+  /**
+   * Returns the aggregate type.
+   *
+   * @return The aggregate type.
+   * @since 1.0
+   */
+  public String type() {
+    return type;
+  }
+
   private void unique() {
     if (uniqueFunction != null) {
       final KStream<String, Pair<JsonObject, JsonValue>> applied =
@@ -894,16 +925,6 @@ public class Aggregate {
           .map((k, p) -> new KeyValue<>(string(p.second), p.first))
           .to(topic(UNIQUE_TOPIC));
     }
-  }
-
-  /**
-   * Returns the aggregate type.
-   *
-   * @return The aggregate type.
-   * @since 1.0
-   */
-  public String type() {
-    return type;
   }
 
   private CompletionStage<Boolean> updateMongoAggregate(final JsonObject aggregate) {
@@ -937,6 +958,27 @@ public class Aggregate {
                     reduction.getJsonObject(BEFORE),
                     reduction,
                     clientSession));
+  }
+
+  private void upgradeEvents() {
+    if (logger != null) {
+      logger.log(INFO, "Upgrading events of {0}.", fullType());
+      upgradeEventLog(fullType(), environment, database, this::upgradeProgress)
+          .thenAccept(
+              result ->
+                  logger.log(
+                      INFO,
+                      "Done upgrading events of {0}.{1}",
+                      new String[] {
+                        fullType(), TRUE.equals(result) ? "" : ". There were errors."
+                      }));
+    }
+  }
+
+  private void upgradeProgress(final long count) {
+    if (count % 10000 == 0) {
+      logger.log(INFO, "Processed {0} events of {1}.", new Object[] {count, fullType()});
+    }
   }
 
   /**
@@ -1042,6 +1084,20 @@ public class Aggregate {
   }
 
   /**
+   * The MongoDB client session that is used for reconstructing aggregate instances from the event
+   * log in case online archiving is used. It is optional.
+   *
+   * @param archiveClientSession the MongoDB client session.
+   * @return The aggregate object itself.
+   * @since 2.0.0
+   */
+  public Aggregate withMongoArchiveClientSession(final ClientSession archiveClientSession) {
+    this.archiveClientSession = archiveClientSession;
+
+    return this;
+  }
+
+  /**
    * The MongoDB client session that is used for transactions. It is mandatory.
    *
    * @param clientSession the MongoDB client session.
@@ -1063,11 +1119,7 @@ public class Aggregate {
    * @since 1.0
    */
   public Aggregate withMongoDatabase(final MongoDatabase database) {
-    this.database = database.withReadConcern(ReadConcern.LINEARIZABLE).withWriteConcern(MAJORITY);
-
-    if (this.databaseArchive == null) {
-      this.databaseArchive = database;
-    }
+    this.database = prepareDatabase(database);
 
     return this;
   }
@@ -1082,7 +1134,7 @@ public class Aggregate {
    * @since 1.2.5
    */
   public Aggregate withMongoDatabaseArchive(final MongoDatabase database) {
-    this.databaseArchive = database != null ? database : this.database;
+    this.databaseArchive = database != null ? prepareDatabase(database) : null;
 
     return this;
   }
