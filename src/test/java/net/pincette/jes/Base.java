@@ -57,7 +57,6 @@ import net.pincette.jes.util.JsonDeserializer;
 import net.pincette.jes.util.JsonFields;
 import net.pincette.jes.util.JsonSerde;
 import net.pincette.jes.util.JsonSerializer;
-import net.pincette.mongo.Session;
 import org.apache.kafka.common.serialization.Serdes;
 import org.apache.kafka.common.serialization.StringDeserializer;
 import org.apache.kafka.common.serialization.StringSerializer;
@@ -96,7 +95,6 @@ class Base {
         .withApp(APP)
         .withType(TYPE)
         .withMongoDatabase(resources.database)
-        .withMongoClientSession(Session.create(resources.client).toCompletableFuture().join())
         .withEnvironment(ENV)
         .withBuilder(new StreamsBuilder())
         .withReducer(PLUS, (command, currentState) -> reduce(currentState, v -> v + 1))

@@ -1,19 +1,12 @@
 package net.pincette.jes;
 
 import static com.mongodb.WriteConcern.MAJORITY;
-import static com.mongodb.client.model.Aggregates.match;
-import static com.mongodb.client.model.Aggregates.project;
-import static com.mongodb.client.model.Filters.and;
 import static com.mongodb.client.model.Filters.eq;
-import static com.mongodb.client.model.Projections.include;
-import static java.lang.Boolean.FALSE;
-import static java.lang.Boolean.TRUE;
 import static java.time.Duration.ofSeconds;
 import static java.time.Instant.now;
 import static java.util.Arrays.stream;
 import static java.util.Optional.ofNullable;
 import static java.util.concurrent.CompletableFuture.completedFuture;
-import static java.util.logging.Level.INFO;
 import static java.util.logging.Level.SEVERE;
 import static javax.json.JsonValue.NULL;
 import static net.pincette.jes.util.Command.hasError;
@@ -39,10 +32,7 @@ import static net.pincette.jes.util.JsonFields.TEST;
 import static net.pincette.jes.util.JsonFields.TIMESTAMP;
 import static net.pincette.jes.util.JsonFields.TYPE;
 import static net.pincette.jes.util.Mongo.addNotDeleted;
-import static net.pincette.jes.util.Mongo.eventToMongo;
-import static net.pincette.jes.util.Mongo.restore;
 import static net.pincette.jes.util.Mongo.updateAggregate;
-import static net.pincette.jes.util.Mongo.upgradeEventLog;
 import static net.pincette.jes.util.Streams.duplicateFilter;
 import static net.pincette.json.JsonUtil.createArrayBuilder;
 import static net.pincette.json.JsonUtil.createDiff;
@@ -50,17 +40,13 @@ import static net.pincette.json.JsonUtil.createObjectBuilder;
 import static net.pincette.json.JsonUtil.createPatch;
 import static net.pincette.json.JsonUtil.emptyObject;
 import static net.pincette.json.JsonUtil.getBoolean;
-import static net.pincette.json.JsonUtil.getString;
 import static net.pincette.json.JsonUtil.isObject;
 import static net.pincette.json.JsonUtil.string;
 import static net.pincette.mongo.BsonUtil.fromJson;
 import static net.pincette.mongo.Collection.deleteOne;
-import static net.pincette.mongo.Collection.insertOne;
 import static net.pincette.mongo.Expression.function;
-import static net.pincette.mongo.JsonClient.aggregate;
 import static net.pincette.mongo.JsonClient.findOne;
 import static net.pincette.mongo.JsonClient.update;
-import static net.pincette.mongo.Session.inTransaction;
 import static net.pincette.util.Builder.create;
 import static net.pincette.util.Collections.list;
 import static net.pincette.util.Collections.set;
@@ -71,8 +57,6 @@ import static net.pincette.util.Util.tryToGetForever;
 
 import com.mongodb.ReadConcern;
 import com.mongodb.client.result.DeleteResult;
-import com.mongodb.client.result.InsertOneResult;
-import com.mongodb.reactivestreams.client.ClientSession;
 import com.mongodb.reactivestreams.client.MongoCollection;
 import com.mongodb.reactivestreams.client.MongoDatabase;
 import java.time.Duration;
@@ -92,15 +76,12 @@ import javax.json.JsonNumber;
 import javax.json.JsonObject;
 import javax.json.JsonObjectBuilder;
 import javax.json.JsonValue;
-import net.pincette.jes.util.AuditFields;
-import net.pincette.jes.util.Mongo.DbContext;
 import net.pincette.jes.util.Reducer;
 import net.pincette.util.Pair;
 import net.pincette.util.TimedCache;
 import org.apache.kafka.streams.KeyValue;
 import org.apache.kafka.streams.StreamsBuilder;
 import org.apache.kafka.streams.kstream.KStream;
-import org.bson.BsonDocument;
 import org.bson.Document;
 import org.bson.conversions.Bson;
 
@@ -129,8 +110,6 @@ import org.bson.conversions.Bson;
  *       _before</code> field contains the previous state of the aggregate, while <code>_after
  *       </code> contains the current one. This is for consumers that want to do other kinds of
  *       analysis than the plain difference.
- *   <dd>monitor
- *   <dt>This optional topic receives monitoring events.
  *   <dd>reply
  *   <dt>On this topic either the new aggregate or the failed command it emitted. The topic is meant
  *       to be routed back to the end-user, for example through Server-Sent Events. A reactive
@@ -173,6 +152,9 @@ import org.bson.conversions.Bson;
  *   <dd>_languages
  *   <dt>An array of language tags in the order of preference. When a validator or some other
  *       component wishes to send messages to the user, it can use the proper language for it.
+ *   <dd>_seq
+ *   <dt>A sequence number. If this field is present it should have the same value as that field in
+ *       the aggregate instance. Otherwise the command is ignored.
  *   <dd>_type
  *   <dt>The aggregate type, which is composed as &lt;application&gt;-&lt;name&gt;. This field is
  *       mandatory.
@@ -210,9 +192,10 @@ import org.bson.conversions.Bson;
  */
 public class Aggregate {
   private static final String AGGREGATE_TOPIC = "aggregate";
+  private static final Duration BACK_OFF = ofSeconds(5);
+  private static final Duration CACHE_WINDOW = ofSeconds(60);
   private static final String COMMAND_TOPIC = "command";
   private static final Duration DUPLICATE_WINDOW = ofSeconds(60);
-  private static final String EVENT_ID = "id";
   private static final String EVENT_TOPIC = "event";
   private static final String EVENT_FULL_TOPIC = "event-full";
   private static final String MONITOR_TOPIC = "monitor";
@@ -223,22 +206,16 @@ public class Aggregate {
       set(COMMAND, CORR, ID, JWT, LANGUAGES, SEQ, TEST, TIMESTAMP, TYPE);
   private static final String UNIQUE_TOPIC = "unique";
   private final Map<String, Reducer> reducers = new HashMap<>();
-  private final TimedCache<String, JsonObject> aggregateCache = new TimedCache<>(DUPLICATE_WINDOW);
-  private String auditTopic;
+  private final TimedCache<String, JsonObject> aggregateCache = new TimedCache<>(CACHE_WINDOW);
   private MongoCollection<Document> aggregateCollection;
   private KStream<String, JsonObject> aggregates;
   private String app;
-  private ClientSession archiveClientSession;
   private boolean breakingTheGlass;
   private StreamsBuilder builder;
-  private ClientSession clientSession;
   private StreamProcessor commandProcessor;
   private KStream<String, JsonObject> commands;
   private MongoDatabase database;
-  private MongoDatabase databaseArchive;
   private String environment = "dev";
-  private MongoCollection<Document> eventCollection;
-  private MongoCollection<BsonDocument> eventCollectionBson;
   private KStream<String, JsonObject> events;
   private KStream<String, JsonObject> eventsFull;
   private Logger logger;
@@ -267,6 +244,12 @@ public class Aggregate {
         .add(STATUS_CODE, 403)
         .add("message", "Forbidden")
         .build();
+  }
+
+  private static Optional<JsonObject> beforeWithoutTechnical(final JsonObject event) {
+    return ofNullable(event.getJsonObject(BEFORE))
+        .map(Aggregate::removeTechnical)
+        .map(JsonObjectBuilder::build);
   }
 
   private static String commandDuplicateKey(final JsonObject command) {
@@ -371,6 +354,13 @@ public class Aggregate {
         .build();
   }
 
+  private static boolean isMatchingCommand(
+      final JsonObject currentState, final JsonObject command) {
+    return Optional.of(command.getInt(SEQ, -1))
+        .map(seq -> seq == -1 || seq == currentState.getInt(SEQ, -1))
+        .orElse(true);
+  }
+
   private static JsonObject makeManaged(final JsonObject state, final JsonObject command) {
     return create(() -> createObjectBuilder(state))
         .updateIf(b -> !state.containsKey(ID), b -> b.add(ID, command.getString(ID)))
@@ -469,11 +459,11 @@ public class Aggregate {
   }
 
   private void aggregates(final KStream<String, JsonObject> reducer) {
-    aggregates =
-        reducer
-            .filter((k, v) -> isEvent(v) && v.containsKey(AFTER))
-            .mapValues(json -> json.getJsonObject(AFTER));
-    aggregates.to(topic(AGGREGATE_TOPIC));
+    reducer
+        .filter((k, v) -> isEvent(v) && v.containsKey(AFTER))
+        .mapValues(json -> json.getJsonObject(AFTER))
+        .to(topic(AGGREGATE_TOPIC));
+    aggregates = builder.stream(topic(AGGREGATE_TOPIC));
   }
 
   /**
@@ -486,25 +476,6 @@ public class Aggregate {
     return app;
   }
 
-  private void audit() {
-    if (auditTopic != null) {
-      events
-          .mapValues(
-              v ->
-                  createObjectBuilder()
-                      .add(AuditFields.AGGREGATE, v.getString(ID))
-                      .add(AuditFields.TYPE, v.getString(TYPE))
-                      .add(AuditFields.COMMAND, v.getString(COMMAND))
-                      .add(AuditFields.TIMESTAMP, v.getJsonNumber(TIMESTAMP).longValue())
-                      .add(AuditFields.USER, getString(v, "/_jwt/sub").orElse("anonymous"))
-                      .add(
-                          AuditFields.BREAKING_THE_GLASS,
-                          getBoolean(v, "/_jwt/breakingTheGlass").orElse(false))
-                      .build())
-          .to(auditTopic);
-    }
-  }
-
   /**
    * This builds the Kafka Streams topology for the aggregate.
    *
@@ -512,27 +483,8 @@ public class Aggregate {
    * @since 1.0
    */
   public StreamsBuilder build() {
-    if (app == null
-        || builder == null
-        || environment == null
-        || type == null
-        || database == null
-        || clientSession == null) {
-      throw new IllegalArgumentException();
-    }
-
-    if (databaseArchive == null) {
-      databaseArchive = database;
-    }
-
-    if (archiveClientSession == null) {
-      archiveClientSession = clientSession;
-    }
-
-    upgradeEvents();
+    must(app != null && builder != null && environment != null && type != null && database != null);
     aggregateCollection = database.getCollection(mongoAggregateCollection());
-    eventCollection = database.getCollection(mongoEventCollection());
-    eventCollectionBson = database.getCollection(mongoEventCollection(), BsonDocument.class);
     commands = createCommands();
     unique();
 
@@ -541,7 +493,6 @@ public class Aggregate {
     aggregates(red);
     replies(red);
     events(red);
-    audit();
 
     return builder;
   }
@@ -583,7 +534,7 @@ public class Aggregate {
                 .map((k, v) -> new KeyValue<>(k.toLowerCase(), idsToLowerCase(v)))
                 .mapValues(Aggregate::completeCommand),
             (k, v) -> commandDuplicateKey(v),
-            ofSeconds(60));
+            DUPLICATE_WINDOW);
 
     return (commandProcessor != null
         ? commandProcessor.apply(commandFilter, builder)
@@ -593,7 +544,7 @@ public class Aggregate {
   private CompletionStage<Boolean> deleteMongoAggregate(final JsonObject aggregate) {
     trace(aggregate, a -> true, () -> "Deleting aggregate " + string(aggregate));
 
-    return deleteOne(aggregateCollection, clientSession, eq(ID, aggregate.getString(ID)))
+    return deleteOne(aggregateCollection, eq(ID, aggregate.getString(ID)))
         .thenApply(DeleteResult::wasAcknowledged)
         .thenApply(result -> must(result, r -> r));
   }
@@ -625,10 +576,10 @@ public class Aggregate {
   }
 
   private void events(final KStream<String, JsonObject> reducer) {
-    eventsFull = reducer.filter((k, v) -> isEvent(v));
-    events = eventsFull.mapValues(Aggregate::plainEvent);
-    eventsFull.to(topic(EVENT_FULL_TOPIC));
-    events.to(topic(EVENT_TOPIC));
+    reducer.filter((k, v) -> isEvent(v)).to(topic(EVENT_FULL_TOPIC));
+    eventsFull = builder.stream(topic(EVENT_FULL_TOPIC));
+    eventsFull.mapValues(Aggregate::plainEvent).to(topic(EVENT_TOPIC));
+    events = builder.stream(topic(EVENT_TOPIC));
   }
 
   /**
@@ -662,62 +613,29 @@ public class Aggregate {
     return app + "-" + type;
   }
 
-  private CompletionStage<Pair<JsonObject, Boolean>> getCurrentState(final JsonObject command) {
+  private CompletionStage<JsonObject> getCurrentState(final JsonObject command) {
     return aggregateCache
         .get(cacheKey(command))
-        .map(
-            currentState ->
-                (CompletionStage<Pair<JsonObject, Boolean>>)
-                    completedFuture(pair(currentState, false)))
+        .map(currentState -> (CompletionStage<JsonObject>) completedFuture(currentState))
         .orElseGet(() -> getMongoCurrentState(command));
   }
 
-  private CompletionStage<Pair<JsonObject, Boolean>> getMongoCurrentState(
-      final JsonObject command) {
+  private CompletionStage<JsonObject> getMongoCurrentState(final JsonObject command) {
     return findOne(aggregateCollection, mongoStateCriterion(command))
         .thenComposeAsync(
             currentState ->
                 currentState
-                    .map(
-                        state ->
-                            (CompletionStage<Pair<JsonObject, Boolean>>)
-                                completedFuture(pair(state, false)))
-                    .orElseGet(
-                        () -> restoreFromCommand(command).thenApply(state -> pair(state, true))));
+                    .map(state -> (CompletionStage<JsonObject>) completedFuture(state))
+                    .orElseGet(() -> completedFuture(emptyObject())));
   }
 
-  private CompletionStage<JsonObject> handleAggregate(
-      final JsonObject reduction, final boolean reconstructed) {
+  private CompletionStage<JsonObject> handleAggregate(final JsonObject reduction) {
     return tryWith(() -> deleteReduction(reduction).orElse(null))
-        .or(() -> updateReductionNew(reduction, reconstructed).orElse(null))
-        .or(() -> updateReductionExisting(reduction, reconstructed).orElse(null))
+        .or(() -> updateReductionNew(reduction).orElse(null))
+        .or(() -> updateReductionExisting(reduction).orElse(null))
         .get()
         .map(result -> result.thenApply(res -> must(res, r -> r)).thenApply(res -> reduction))
         .orElseGet(() -> completedFuture(reduction));
-  }
-
-  private CompletionStage<Boolean> insertMongoEvent(final JsonObject event) {
-    trace(event, e -> true, () -> "Inserting event " + string(event));
-
-    return insertOne(eventCollectionBson, clientSession, eventToMongo(event))
-        .thenApply(InsertOneResult::wasAcknowledged)
-        .thenApply(result -> must(result, r -> r));
-  }
-
-  private CompletionStage<Boolean> isDuplicate(final JsonObject command) {
-    return aggregate(
-            eventCollection,
-            list(
-                match(
-                    and(
-                        eq(ID + "." + EVENT_ID, command.getString(ID)),
-                        eq(CORR, command.getString(CORR)),
-                        eq(COMMAND, command.getString(COMMAND)))),
-                project(include(ID))))
-        .thenApply(
-            result ->
-                trace(result, r -> !r.isEmpty(), () -> "Duplicate command " + string(command)))
-        .thenApply(result -> !result.isEmpty());
   }
 
   private JsonObject keepId(final JsonObject currentState, final JsonObject command) {
@@ -750,10 +668,6 @@ public class Aggregate {
     return fullType() + "-" + environment;
   }
 
-  private String mongoEventCollection() {
-    return fullType() + "-event-" + environment;
-  }
-
   private Bson mongoStateCriterion(final JsonObject command) {
     return ofNullable(uniqueFunction)
         .map(f -> f.apply(command))
@@ -777,12 +691,8 @@ public class Aggregate {
   private CompletionStage<JsonObject> processCommand(final JsonObject command) {
     return reduceCommand(command)
         .thenComposeAsync(
-            pair ->
-                inTransaction(
-                        session ->
-                            saveReduction(
-                                pair.first, reduction -> handleAggregate(reduction, pair.second)),
-                        clientSession)
+            newState ->
+                saveReduction(newState, this::handleAggregate)
                     .thenApply(
                         result -> {
                           if (isEvent(result)) {
@@ -803,31 +713,19 @@ public class Aggregate {
   }
 
   private JsonObject reduce(final JsonObject command) {
-    return tryToGetForever(
-            () ->
-                isDuplicate(command)
-                    .thenComposeAsync(
-                        result ->
-                            FALSE.equals(result)
-                                ? processCommand(command)
-                                : completedFuture(emptyObject())),
-            ofSeconds(5),
-            this::logException)
+    return tryToGetForever(() -> processCommand(command), BACK_OFF, this::logException)
         .toCompletableFuture()
         .join();
   }
 
-  private CompletionStage<Pair<JsonObject, Boolean>> reduceCommand(final JsonObject command) {
+  private CompletionStage<JsonObject> reduceCommand(final JsonObject command) {
     final JsonObject checked = checkUnique(command);
 
     return hasError(checked)
-        ? completedFuture(pair(checked, false))
+        ? completedFuture(checked)
         : getCurrentState(command)
-            .thenApply(pair -> pair(makeManaged(pair.first, command), pair.second))
-            .thenComposeAsync(
-                pair ->
-                    reduceIfAllowed(pair.first, keepId(pair.first, command))
-                        .thenApply(reduction -> pair(reduction, pair.second)));
+            .thenApply(state -> makeManaged(state, command))
+            .thenComposeAsync(state -> reduceIfMatching(state, command));
   }
 
   private CompletionStage<JsonObject> reduceIfAllowed(
@@ -836,6 +734,13 @@ public class Aggregate {
         ? executeReducer(command, currentState)
             .thenApply(newState -> processNewState(currentState, newState, command))
         : completedFuture(accessError(command));
+  }
+
+  private CompletionStage<JsonObject> reduceIfMatching(
+      final JsonObject currentState, final JsonObject command) {
+    return isMatchingCommand(currentState, command)
+        ? reduceIfAllowed(currentState, keepId(currentState, command))
+        : completedFuture(currentState);
   }
 
   private KStream<String, JsonObject> reducer() {
@@ -862,28 +767,17 @@ public class Aggregate {
   }
 
   private void replies(final KStream<String, JsonObject> reducer) {
-    replies =
-        aggregates.flatMapValues(v -> list(v, createAggregateMessage(v))).merge(errors(reducer));
-
-    replies.to(topic(REPLY_TOPIC));
-  }
-
-  private CompletionStage<JsonObject> restoreFromCommand(final JsonObject command) {
-    return restore(
-        command.getString(ID),
-        fullType(),
-        environment,
-        new DbContext(database, clientSession),
-        new DbContext(databaseArchive, archiveClientSession));
+    aggregates
+        .flatMapValues(v -> list(v, createAggregateMessage(v)))
+        .merge(errors(reducer))
+        .to(topic(REPLY_TOPIC));
+    replies = builder.stream(topic(REPLY_TOPIC));
   }
 
   private CompletionStage<JsonObject> saveReduction(
       final JsonObject reduction,
       final Function<JsonObject, CompletionStage<JsonObject>> handleAggregate) {
-    return isEvent(reduction)
-        ? insertMongoEvent(plainEvent(reduction))
-            .thenComposeAsync(result -> handleAggregate.apply(reduction))
-        : completedFuture(reduction);
+    return isEvent(reduction) ? handleAggregate.apply(reduction) : completedFuture(reduction);
   }
 
   /**
@@ -930,21 +824,18 @@ public class Aggregate {
   private CompletionStage<Boolean> updateMongoAggregate(final JsonObject aggregate) {
     trace(aggregate, a -> true, () -> "Replacing aggregate " + string(aggregate));
 
-    return update(aggregateCollection, aggregate, clientSession)
-        .thenApply(result -> must(result, r -> r));
+    return update(aggregateCollection, aggregate).thenApply(result -> must(result, r -> r));
   }
 
-  private Optional<CompletionStage<Boolean>> updateReductionNew(
-      final JsonObject reduction, final boolean reconstructed) {
-    return Optional.of(reduction.getJsonObject(BEFORE))
-        .filter(before -> reconstructed)
+  private Optional<CompletionStage<Boolean>> updateReductionNew(final JsonObject reduction) {
+    return beforeWithoutTechnical(reduction)
+        .filter(JsonObject::isEmpty)
         .map(before -> updateMongoAggregate(reduction.getJsonObject(AFTER)));
   }
 
-  private Optional<CompletionStage<Boolean>> updateReductionExisting(
-      final JsonObject reduction, final boolean reconstructed) {
-    return Optional.of(reduction.getJsonObject(BEFORE))
-        .filter(before -> !reconstructed)
+  private Optional<CompletionStage<Boolean>> updateReductionExisting(final JsonObject reduction) {
+    return beforeWithoutTechnical(reduction)
+        .filter(before -> !before.isEmpty())
         .map(
             before ->
                 trace(
@@ -953,32 +844,7 @@ public class Aggregate {
                     () -> "Updating aggregate " + string(reduction.getJsonObject(AFTER))))
         .map(
             before ->
-                updateAggregate(
-                    aggregateCollection,
-                    reduction.getJsonObject(BEFORE),
-                    reduction,
-                    clientSession));
-  }
-
-  private void upgradeEvents() {
-    if (logger != null) {
-      logger.log(INFO, "Upgrading events of {0}.", fullType());
-      upgradeEventLog(fullType(), environment, database, this::upgradeProgress)
-          .thenAccept(
-              result ->
-                  logger.log(
-                      INFO,
-                      "Done upgrading events of {0}.{1}",
-                      new String[] {
-                        fullType(), TRUE.equals(result) ? "" : ". There were errors."
-                      }));
-    }
-  }
-
-  private void upgradeProgress(final long count) {
-    if (count % 10000 == 0) {
-      logger.log(INFO, "Processed {0} events of {1}.", new Object[] {count, fullType()});
-    }
+                updateAggregate(aggregateCollection, reduction.getJsonObject(BEFORE), reduction));
   }
 
   /**
@@ -990,21 +856,6 @@ public class Aggregate {
    */
   public Aggregate withApp(final String app) {
     this.app = app;
-
-    return this;
-  }
-
-  /**
-   * Sets the audit Kafka topic, in which case auditing information is published on it. These are
-   * JSON messages with the fields defined in <code>AuditFields</code>.
-   *
-   * @param auditTopic the Kafka topic for auditing.
-   * @return The aggregate object itself.
-   * @since 1.0
-   * @see net.pincette.jes.util.AuditFields
-   */
-  public Aggregate withAudit(final String auditTopic) {
-    this.auditTopic = auditTopic;
 
     return this;
   }
@@ -1084,33 +935,6 @@ public class Aggregate {
   }
 
   /**
-   * The MongoDB client session that is used for reconstructing aggregate instances from the event
-   * log in case online archiving is used. It is optional.
-   *
-   * @param archiveClientSession the MongoDB client session.
-   * @return The aggregate object itself.
-   * @since 2.0.0
-   */
-  public Aggregate withMongoArchiveClientSession(final ClientSession archiveClientSession) {
-    this.archiveClientSession = archiveClientSession;
-
-    return this;
-  }
-
-  /**
-   * The MongoDB client session that is used for transactions. It is mandatory.
-   *
-   * @param clientSession the MongoDB client session.
-   * @return The aggregate object itself.
-   * @since 2.0.0
-   */
-  public Aggregate withMongoClientSession(final ClientSession clientSession) {
-    this.clientSession = clientSession;
-
-    return this;
-  }
-
-  /**
    * The MongoDB database in which the events and aggregates are written. The database will be used
    * with majority read and write concerns.
    *
@@ -1120,21 +944,6 @@ public class Aggregate {
    */
   public Aggregate withMongoDatabase(final MongoDatabase database) {
     this.database = prepareDatabase(database);
-
-    return this;
-  }
-
-  /**
-   * The MongoDB archive database that is used to reconstruct aggregate instances from the event
-   * log. This is for the MongoDB Atlas Online Archive feature. It may be <code>null</code>, in
-   * which case the regular database connection will be used.
-   *
-   * @param database the database connection.
-   * @return The aggregate object itself.
-   * @since 1.2.5
-   */
-  public Aggregate withMongoDatabaseArchive(final MongoDatabase database) {
-    this.databaseArchive = database != null ? prepareDatabase(database) : null;
 
     return this;
   }

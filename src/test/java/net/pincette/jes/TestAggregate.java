@@ -5,12 +5,6 @@ import org.junit.jupiter.api.Test;
 
 class TestAggregate extends Base {
   @Test
-  @DisplayName("duplicate")
-  void duplicate() {
-    runTest("duplicate");
-  }
-
-  @Test
   @DisplayName("plusminus")
   void plusminus() {
     runTest("plusminus");
