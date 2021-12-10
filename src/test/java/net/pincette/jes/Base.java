@@ -75,7 +75,6 @@ class Base {
   static final String APP = "test";
   static final JsonObject BAD_USER = o(f(SUB, v("bad")));
   static final String COMMAND = "command";
-  static final String ENV = "dev";
   static final String EVENT = "event";
   static final String EVENT_FULL = "event-full";
   static final JsonObject GOOD_USER = o(f(SUB, v("good")), f(ROLES, a(v("test"))));
@@ -90,12 +89,12 @@ class Base {
   private static final List<String> OUTPUTS = list(AGGREGATE, EVENT, EVENT_FULL, REPLY);
   protected static Resources resources;
 
-  private static StreamsBuilder aggregate() {
+  private static StreamsBuilder aggregate(final String environment) {
     return new Aggregate()
         .withApp(APP)
         .withType(TYPE)
         .withMongoDatabase(resources.database)
-        .withEnvironment(ENV)
+        .withEnvironment(environment)
         .withBuilder(new StreamsBuilder())
         .withReducer(PLUS, (command, currentState) -> reduce(currentState, v -> v + 1))
         .withReducer(MINUS, (command, currentState) -> reduce(currentState, v -> v - 1))
@@ -146,13 +145,15 @@ class Base {
   }
 
   private static TestInputTopic<String, JsonObject> createInputTopic(
-      final TopologyTestDriver driver, final String name) {
-    return driver.createInputTopic(topic(name), new StringSerializer(), new JsonSerializer());
+      final TopologyTestDriver driver, final String name, final String environment) {
+    return driver.createInputTopic(
+        topic(name, environment), new StringSerializer(), new JsonSerializer());
   }
 
   private static TestOutputTopic<String, JsonObject> createOutputTopic(
-      final TopologyTestDriver driver, final String name) {
-    return driver.createOutputTopic(topic(name), new StringDeserializer(), new JsonDeserializer());
+      final TopologyTestDriver driver, final String name, final String environment) {
+    return driver.createOutputTopic(
+        topic(name, environment), new StringDeserializer(), new JsonDeserializer());
   }
 
   private static void drop(final String collection) {
@@ -221,8 +222,8 @@ class Base {
     return "/tests/" + testName + "/" + kind;
   }
 
-  private static String topic(final String name) {
-    return fullType() + "-" + name + "-" + ENV;
+  private static String topic(final String name, final String environment) {
+    return fullType() + "-" + name + (environment != null ? ("-" + environment) : "");
   }
 
   private static <T> Map<String, T> topics(
@@ -244,13 +245,20 @@ class Base {
   }
 
   protected void runTest(final String name) {
+    runTest(name, null);
+  }
+
+  protected void runTest(final String name, final String environment) {
     tryToDoWithRethrow(
-        () -> new TopologyTestDriver(aggregate().build(), CONFIG),
+        () -> new TopologyTestDriver(aggregate(environment).build(), CONFIG),
         testDriver -> {
           final Map<String, TestInputTopic<String, JsonObject>> inputTopics =
-              topics(testDriver, list(COMMAND), Base::createInputTopic);
+              topics(
+                  testDriver,
+                  list(COMMAND),
+                  (driver, n) -> createInputTopic(driver, n, environment));
           final Map<String, TestOutputTopic<String, JsonObject>> outputTopics =
-              topics(testDriver, OUTPUTS, Base::createOutputTopic);
+              topics(testDriver, OUTPUTS, (driver, n) -> createOutputTopic(driver, n, environment));
 
           inputTopics
               .get(COMMAND)

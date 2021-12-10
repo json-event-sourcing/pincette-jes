@@ -215,7 +215,7 @@ public class Aggregate {
   private StreamProcessor commandProcessor;
   private KStream<String, JsonObject> commands;
   private MongoDatabase database;
-  private String environment = "dev";
+  private String environment;
   private KStream<String, JsonObject> events;
   private KStream<String, JsonObject> eventsFull;
   private Logger logger;
@@ -483,7 +483,7 @@ public class Aggregate {
    * @since 1.0
    */
   public StreamsBuilder build() {
-    must(app != null && builder != null && environment != null && type != null && database != null);
+    must(app != null && builder != null && type != null && database != null);
     aggregateCollection = database.getCollection(mongoAggregateCollection());
     commands = createCommands();
     unique();
@@ -563,6 +563,10 @@ public class Aggregate {
    */
   public String environment() {
     return environment;
+  }
+
+  private String environmentSuffix() {
+    return environment != null ? ("-" + environment) : "";
   }
 
   /**
@@ -665,7 +669,7 @@ public class Aggregate {
   }
 
   private String mongoAggregateCollection() {
-    return fullType() + "-" + environment;
+    return fullType() + environmentSuffix();
   }
 
   private Bson mongoStateCriterion(final JsonObject command) {
@@ -788,7 +792,7 @@ public class Aggregate {
    * @return The topic name.
    */
   public String topic(final String purpose) {
-    return fullType() + "-" + purpose + "-" + environment;
+    return fullType() + "-" + purpose + environmentSuffix();
   }
 
   private <T> T trace(final T value, final Predicate<T> test, final Supplier<String> message) {

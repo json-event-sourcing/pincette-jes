@@ -463,7 +463,7 @@ You can generate a new project with the following command:
 mvn archetype:generate -B \
                        -DarchetypeGroupId=net.pincette \
                        -DarchetypeArtifactId=pincette-jes-archetype \
-                       -DarchetypeVersion=2.0.1 \
+                       -DarchetypeVersion=2.0.2 \
                        -DgroupId=net.pincette \
                        -DartifactId=myapp \
                        -Dversion=1.0-SNAPSHOT
