@@ -38,11 +38,4 @@ class TestAggregate extends Base {
     runTest("put_good_user");
     runTest("put_good_user", "dev");
   }
-
-  @Test
-  @DisplayName("unknown")
-  void unknown() {
-    runTest("unknown");
-    runTest("unknown", "dev");
-  }
 }

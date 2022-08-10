@@ -1,39 +1,40 @@
 package net.pincette.jes;
 
 import static com.mongodb.WriteConcern.MAJORITY;
+import static com.mongodb.client.model.Filters.and;
 import static com.mongodb.client.model.Filters.eq;
+import static com.mongodb.client.model.Filters.ne;
 import static java.time.Duration.ofSeconds;
 import static java.time.Instant.now;
 import static java.util.Arrays.stream;
 import static java.util.Optional.ofNullable;
 import static java.util.concurrent.CompletableFuture.completedFuture;
 import static java.util.logging.Level.SEVERE;
+import static java.util.stream.Collectors.toList;
+import static java.util.stream.Stream.concat;
 import static javax.json.JsonValue.NULL;
-import static net.pincette.jes.util.Command.hasError;
-import static net.pincette.jes.util.Command.isAllowed;
-import static net.pincette.jes.util.Command.isCommand;
-import static net.pincette.jes.util.Commands.DELETE;
-import static net.pincette.jes.util.Commands.PATCH;
-import static net.pincette.jes.util.Commands.PUT;
-import static net.pincette.jes.util.Event.isEvent;
-import static net.pincette.jes.util.JsonFields.AFTER;
-import static net.pincette.jes.util.JsonFields.BEFORE;
-import static net.pincette.jes.util.JsonFields.COMMAND;
-import static net.pincette.jes.util.JsonFields.CORR;
-import static net.pincette.jes.util.JsonFields.DELETED;
-import static net.pincette.jes.util.JsonFields.ERROR;
-import static net.pincette.jes.util.JsonFields.ID;
-import static net.pincette.jes.util.JsonFields.JWT;
-import static net.pincette.jes.util.JsonFields.LANGUAGES;
-import static net.pincette.jes.util.JsonFields.OPS;
-import static net.pincette.jes.util.JsonFields.SEQ;
-import static net.pincette.jes.util.JsonFields.STATUS_CODE;
-import static net.pincette.jes.util.JsonFields.TEST;
-import static net.pincette.jes.util.JsonFields.TIMESTAMP;
-import static net.pincette.jes.util.JsonFields.TYPE;
-import static net.pincette.jes.util.Mongo.addNotDeleted;
-import static net.pincette.jes.util.Mongo.updateAggregate;
-import static net.pincette.jes.util.Streams.duplicateFilter;
+import static net.pincette.jes.Command.hasError;
+import static net.pincette.jes.Command.isAllowed;
+import static net.pincette.jes.Command.isCommand;
+import static net.pincette.jes.Commands.DELETE;
+import static net.pincette.jes.Commands.PATCH;
+import static net.pincette.jes.Commands.PUT;
+import static net.pincette.jes.Event.isEvent;
+import static net.pincette.jes.JsonFields.AFTER;
+import static net.pincette.jes.JsonFields.BEFORE;
+import static net.pincette.jes.JsonFields.COMMAND;
+import static net.pincette.jes.JsonFields.CORR;
+import static net.pincette.jes.JsonFields.DELETED;
+import static net.pincette.jes.JsonFields.ERROR;
+import static net.pincette.jes.JsonFields.ID;
+import static net.pincette.jes.JsonFields.JWT;
+import static net.pincette.jes.JsonFields.LANGUAGES;
+import static net.pincette.jes.JsonFields.OPS;
+import static net.pincette.jes.JsonFields.SEQ;
+import static net.pincette.jes.JsonFields.STATUS_CODE;
+import static net.pincette.jes.JsonFields.TEST;
+import static net.pincette.jes.JsonFields.TIMESTAMP;
+import static net.pincette.jes.JsonFields.TYPE;
 import static net.pincette.json.JsonUtil.createArrayBuilder;
 import static net.pincette.json.JsonUtil.createDiff;
 import static net.pincette.json.JsonUtil.createObjectBuilder;
@@ -44,9 +45,19 @@ import static net.pincette.json.JsonUtil.isObject;
 import static net.pincette.json.JsonUtil.string;
 import static net.pincette.mongo.BsonUtil.fromJson;
 import static net.pincette.mongo.Collection.deleteOne;
+import static net.pincette.mongo.Collection.exec;
 import static net.pincette.mongo.Expression.function;
 import static net.pincette.mongo.JsonClient.findOne;
 import static net.pincette.mongo.JsonClient.update;
+import static net.pincette.mongo.Patch.updateOperators;
+import static net.pincette.rs.AsyncDepend.mapAsync;
+import static net.pincette.rs.Box.box;
+import static net.pincette.rs.Filter.filter;
+import static net.pincette.rs.Mapper.map;
+import static net.pincette.rs.NotFilter.notFilter;
+import static net.pincette.rs.PassThrough.passThrough;
+import static net.pincette.rs.Pipe.pipe;
+import static net.pincette.rs.Util.duplicateFilter;
 import static net.pincette.util.Builder.create;
 import static net.pincette.util.Collections.list;
 import static net.pincette.util.Collections.set;
@@ -56,45 +67,50 @@ import static net.pincette.util.Util.must;
 import static net.pincette.util.Util.tryToGetForever;
 
 import com.mongodb.ReadConcern;
+import com.mongodb.bulk.BulkWriteResult;
+import com.mongodb.client.model.BulkWriteOptions;
+import com.mongodb.client.model.UpdateOneModel;
 import com.mongodb.client.result.DeleteResult;
 import com.mongodb.reactivestreams.client.MongoCollection;
 import com.mongodb.reactivestreams.client.MongoDatabase;
 import java.time.Duration;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.CompletionStage;
+import java.util.concurrent.Flow.Processor;
 import java.util.function.BinaryOperator;
 import java.util.function.Function;
 import java.util.function.Predicate;
 import java.util.function.Supplier;
 import java.util.function.UnaryOperator;
 import java.util.logging.Logger;
+import java.util.stream.Stream;
 import javax.json.JsonArray;
 import javax.json.JsonNumber;
 import javax.json.JsonObject;
 import javax.json.JsonObjectBuilder;
 import javax.json.JsonValue;
-import net.pincette.jes.util.Reducer;
-import net.pincette.util.Pair;
+import net.pincette.json.JsonUtil;
+import net.pincette.rs.Fanout;
+import net.pincette.rs.streams.Message;
+import net.pincette.rs.streams.Streams;
 import net.pincette.util.TimedCache;
-import org.apache.kafka.streams.KeyValue;
-import org.apache.kafka.streams.StreamsBuilder;
-import org.apache.kafka.streams.kstream.KStream;
 import org.bson.Document;
 import org.bson.conversions.Bson;
 
 /**
- * With this class JSON aggregates are managed using Kafka Streams. You give it reducers, which
- * calculate the new aggregate state with the current one and an incoming command. For every
- * aggregate instance all commands are processed sequentially. The result of a reducer execution is
- * compared with the current aggregate state and the difference is emitted as an event. A reducer
- * may also find problems in the command. In that case it should return the command, marked with
- * <code>"_error": true</code>. No event will be emitted then.
+ * This class manages the state of JSON aggregates. You give it reducers, which calculate the new
+ * aggregate state with the current one and an incoming command. For every aggregate instance all
+ * commands are processed sequentially. The result of a reducer execution is compared with the
+ * current aggregate state and the difference is emitted as an event. A reducer may also find
+ * problems in the command. In that case it should return the command, marked with <code>
+ * "_error": true</code>. No event will be emitted then.
  *
- * <p>The external interface at runtime is a set op Kafka topics. Their names always have the form
- * &lt;app&gt;-&lt;type&gt;-&lt;purpose&gt;-&lt;environment&gt;. The following topics are expected
+ * <p>The external interface at runtime is a set of topics. Their names always have the form
+ * &lt;app&gt;-&lt;type&gt;-&lt;purpose&gt;[-&lt;environment&gt;]. The following topics are expected
  * to exist (the names are the purpose):
  *
  * <dl>
@@ -187,10 +203,12 @@ import org.bson.conversions.Bson;
  *   <dt>The aggregate type, which is composed as &lt;application&gt;-&lt;name&gt;.
  * </dl>
  *
+ * @param <T> the value type for the topic source.
+ * @param <U> the value type for the topic sink.
  * @author Werner Donn\u00e9
  * @since 1.0
  */
-public class Aggregate {
+public class Aggregate<T, U> {
   private static final String AGGREGATE_TOPIC = "aggregate";
   private static final Duration BACK_OFF = ofSeconds(5);
   private static final Duration CACHE_WINDOW = ofSeconds(60);
@@ -198,30 +216,26 @@ public class Aggregate {
   private static final Duration DUPLICATE_WINDOW = ofSeconds(60);
   private static final String EVENT_TOPIC = "event";
   private static final String EVENT_FULL_TOPIC = "event-full";
-  private static final String MONITOR_TOPIC = "monitor";
+  private static final Bson NOT_DELETED = ne(DELETED, true);
   private static final String REDUCER_COMMAND = "command";
   private static final String REDUCER_STATE = "state";
   private static final String REPLY_TOPIC = "reply";
+  private static final String SET = "$set";
   private static final Set<String> TECHNICAL_FIELDS =
       set(COMMAND, CORR, ID, JWT, LANGUAGES, SEQ, TEST, TIMESTAMP, TYPE);
   private static final String UNIQUE_TOPIC = "unique";
+
   private final Map<String, Reducer> reducers = new HashMap<>();
   private final TimedCache<String, JsonObject> aggregateCache = new TimedCache<>(CACHE_WINDOW);
   private MongoCollection<Document> aggregateCollection;
-  private KStream<String, JsonObject> aggregates;
   private String app;
   private boolean breakingTheGlass;
-  private StreamsBuilder builder;
-  private StreamProcessor commandProcessor;
-  private KStream<String, JsonObject> commands;
+  private Streams<String, JsonObject, T, U> builder;
+  private Processor<Message<String, JsonObject>, Message<String, JsonObject>> commandProcessor;
   private MongoDatabase database;
   private String environment;
-  private KStream<String, JsonObject> events;
-  private KStream<String, JsonObject> eventsFull;
   private Logger logger;
-  private KStream<String, JsonObject> monitor;
   private Reducer reducer;
-  private KStream<String, JsonObject> replies;
   private String type;
   private JsonValue uniqueExpression;
   private Function<JsonObject, JsonValue> uniqueFunction;
@@ -246,6 +260,16 @@ public class Aggregate {
         .build();
   }
 
+  private static Bson addNotDeleted(final Bson query) {
+    return and(list(query, NOT_DELETED));
+  }
+
+  private static Processor<Message<String, JsonObject>, Message<String, JsonObject>> aggregates() {
+    return box(
+        filter((Message<String, JsonObject> m) -> isEvent(m.value) && m.value.containsKey(AFTER)),
+        map(m -> m.withValue(m.value.getJsonObject(AFTER))));
+  }
+
   private static Optional<JsonObject> beforeWithoutTechnical(final JsonObject event) {
     return ofNullable(event.getJsonObject(BEFORE))
         .map(Aggregate::removeTechnical)
@@ -254,6 +278,13 @@ public class Aggregate {
 
   private static String commandDuplicateKey(final JsonObject command) {
     return command.getString(ID) + command.getString(CORR) + command.getString(COMMAND);
+  }
+
+  private static Processor<Message<String, JsonObject>, Message<String, JsonObject>> commands() {
+    return pipe(filter((Message<String, JsonObject> m) -> isCommand(m.value)))
+        .then(map(m -> m.withKey(m.key.toLowerCase()).withValue(idsToLowerCase(m.value))))
+        .then(map(m -> m.withValue(completeCommand(m.value))))
+        .then(duplicateFilter(m -> commandDuplicateKey(m.value), DUPLICATE_WINDOW));
   }
 
   private static JsonObject completeCommand(final JsonObject command) {
@@ -282,13 +313,6 @@ public class Aggregate {
                     .add(TIMESTAMP, now)
                     .remove(JWT))
         .updateIf(b -> command.containsKey(JWT), b -> b.add(JWT, command.getJsonObject(JWT)))
-        .build();
-  }
-
-  private static JsonObject createAggregateMessage(final JsonObject aggregate) {
-    return createObjectBuilder()
-        .add(TYPE, aggregate.getString(TYPE))
-        .add(JWT, aggregate.getJsonObject(JWT))
         .build();
   }
 
@@ -343,8 +367,16 @@ public class Aggregate {
     return completedFuture(createObjectBuilder(currentState).add(DELETED, true).build());
   }
 
-  private static KStream<String, JsonObject> errors(final KStream<String, JsonObject> reducer) {
-    return reducer.filter((k, v) -> isCommand(v) && hasError(v));
+  private static Processor<Message<String, JsonObject>, Message<String, JsonObject>> errors() {
+    return filter(m -> isCommand(m.value) && hasError(m.value));
+  }
+
+  private static Processor<Message<String, JsonObject>, Message<String, JsonObject>> events() {
+    return map(m -> m.withValue(plainEvent(m.value)));
+  }
+
+  private static Processor<Message<String, JsonObject>, Message<String, JsonObject>> eventsFull() {
+    return filter(m -> isEvent(m.value));
   }
 
   private static JsonObject idsToLowerCase(final JsonObject json) {
@@ -440,6 +472,24 @@ public class Aggregate {
         .reduce(createObjectBuilder(json), JsonObjectBuilder::remove, (b1, b2) -> b1);
   }
 
+  private static JsonObject technicalUpdateOperator(final JsonObject event) {
+    return createObjectBuilder()
+        .add(
+            SET,
+            createObjectBuilder()
+                .add(SEQ, event.getInt(SEQ))
+                .add(CORR, event.getString(CORR))
+                .add(TIMESTAMP, event.getJsonNumber(TIMESTAMP)))
+        .build();
+  }
+
+  private static Processor<Message<String, JsonObject>, Message<String, JsonObject>> unique(
+      final Function<JsonObject, JsonValue> uniqueFunction) {
+    return pipe(map((Message<String, JsonObject> m) -> pair(m, uniqueFunction.apply(m.value))))
+        .then(notFilter(pair -> pair.second.equals(NULL)))
+        .then(map(pair -> pair.first.withKey(string(pair.second))));
+  }
+
   private static JsonObject uniqueError(final JsonObject command) {
     return createObjectBuilder(command)
         .add(ERROR, true)
@@ -448,22 +498,26 @@ public class Aggregate {
         .build();
   }
 
-  /**
-   * Returns the aggregate stream.
-   *
-   * @return The aggregate stream.
-   * @since 1.0
-   */
-  public KStream<String, JsonObject> aggregates() {
-    return aggregates;
-  }
+  private static CompletionStage<Boolean> updateAggregate(
+      final MongoCollection<Document> collection,
+      final JsonObject currentState,
+      final JsonObject event) {
+    final Bson filter = eq(ID, currentState.getString(ID));
+    final List<UpdateOneModel<Document>> operators =
+        concat(
+                Stream.of(technicalUpdateOperator(event)),
+                updateOperators(
+                    currentState,
+                    event.getJsonArray(OPS).stream()
+                        .filter(JsonUtil::isObject)
+                        .map(JsonValue::asJsonObject)))
+            .map(op -> new UpdateOneModel<Document>(filter, fromJson(op)))
+            .collect(toList());
+    final BulkWriteOptions options = new BulkWriteOptions().ordered(true);
 
-  private void aggregates(final KStream<String, JsonObject> reducer) {
-    reducer
-        .filter((k, v) -> isEvent(v) && v.containsKey(AFTER))
-        .mapValues(json -> json.getJsonObject(AFTER))
-        .to(topic(AGGREGATE_TOPIC));
-    aggregates = builder.stream(topic(AGGREGATE_TOPIC));
+    return exec(collection, c -> c.bulkWrite(operators, options))
+        .thenApply(BulkWriteResult::wasAcknowledged)
+        .thenApply(result -> must(result, r -> r));
   }
 
   /**
@@ -477,24 +531,30 @@ public class Aggregate {
   }
 
   /**
-   * This builds the Kafka Streams topology for the aggregate.
+   * This builds the <code>Streams</code> topology for the aggregate.
    *
    * @return The builder that was given before.
    * @since 1.0
    */
-  public StreamsBuilder build() {
+  public Streams<String, JsonObject, T, U> build() {
     must(app != null && builder != null && type != null && database != null);
     aggregateCollection = database.getCollection(mongoAggregateCollection());
-    commands = createCommands();
-    unique();
 
-    final KStream<String, JsonObject> red = reducer();
+    final Processor<Message<String, JsonObject>, Message<String, JsonObject>> errors = errors();
+    final Processor<Message<String, JsonObject>, Message<String, JsonObject>> eventsFull =
+        eventsFull();
 
-    aggregates(red);
-    replies(red);
-    events(red);
-
-    return builder;
+    return commandSource(createCommands())
+        .process(reducer())
+        .subscribe(Fanout.of(eventsFull, errors))
+        .to(topic(EVENT_FULL_TOPIC), eventsFull)
+        .to(topic(REPLY_TOPIC), errors)
+        .from(topic(EVENT_FULL_TOPIC), aggregates())
+        .to(topic(AGGREGATE_TOPIC))
+        .from(topic(EVENT_FULL_TOPIC), events())
+        .to(topic(EVENT_TOPIC))
+        .from(topic(AGGREGATE_TOPIC), passThrough())
+        .to(topic(REPLY_TOPIC));
   }
 
   private String cacheKey(final JsonObject command) {
@@ -512,33 +572,18 @@ public class Aggregate {
         .orElse(null);
   }
 
-  private KStream<String, JsonObject> commandSource() {
-    return uniqueFunction != null ? builder.stream(topic(UNIQUE_TOPIC)) : commands;
+  private Streams<String, JsonObject, T, U> commandSource(
+      final Processor<Message<String, JsonObject>, Message<String, JsonObject>> commands) {
+    return uniqueFunction != null
+        ? builder
+            .from(topic(COMMAND_TOPIC), unique(uniqueFunction))
+            .to(topic(UNIQUE_TOPIC))
+            .from(topic(UNIQUE_TOPIC), commands)
+        : builder.from(topic(COMMAND_TOPIC), commands);
   }
 
-  /**
-   * Returns the command stream, after applying potential command processors.
-   *
-   * @return The command stream.
-   * @since 1.0
-   */
-  public KStream<String, JsonObject> commands() {
-    return commands;
-  }
-
-  private KStream<String, JsonObject> createCommands() {
-    final KStream<String, JsonObject> com = builder.stream(topic(COMMAND_TOPIC));
-    final KStream<String, JsonObject> commandFilter =
-        duplicateFilter(
-            com.filter((k, v) -> isCommand(v))
-                .map((k, v) -> new KeyValue<>(k.toLowerCase(), idsToLowerCase(v)))
-                .mapValues(Aggregate::completeCommand),
-            (k, v) -> commandDuplicateKey(v),
-            DUPLICATE_WINDOW);
-
-    return (commandProcessor != null
-        ? commandProcessor.apply(commandFilter, builder)
-        : commandFilter);
+  private Processor<Message<String, JsonObject>, Message<String, JsonObject>> createCommands() {
+    return commandProcessor != null ? box(commands(), commandProcessor) : commands();
   }
 
   private CompletionStage<Boolean> deleteMongoAggregate(final JsonObject aggregate) {
@@ -567,33 +612,6 @@ public class Aggregate {
 
   private String environmentSuffix() {
     return environment != null ? ("-" + environment) : "";
-  }
-
-  /**
-   * Returns the event stream.
-   *
-   * @return The event stream.
-   * @since 1.0
-   */
-  public KStream<String, JsonObject> events() {
-    return events;
-  }
-
-  private void events(final KStream<String, JsonObject> reducer) {
-    reducer.filter((k, v) -> isEvent(v)).to(topic(EVENT_FULL_TOPIC));
-    eventsFull = builder.stream(topic(EVENT_FULL_TOPIC));
-    eventsFull.mapValues(Aggregate::plainEvent).to(topic(EVENT_TOPIC));
-    events = builder.stream(topic(EVENT_TOPIC));
-  }
-
-  /**
-   * Returns the full event stream.
-   *
-   * @return The event stream.
-   * @since 1.0
-   */
-  public KStream<String, JsonObject> eventsFull() {
-    return eventsFull;
   }
 
   private CompletionStage<JsonObject> executeReducer(
@@ -654,20 +672,6 @@ public class Aggregate {
     }
   }
 
-  /**
-   * Returns the monitor stream.
-   *
-   * @return The monitor stream.
-   * @since 1.0
-   */
-  public KStream<String, JsonObject> monitor() {
-    if (monitor == null) {
-      monitor = builder.stream(topic(MONITOR_TOPIC));
-    }
-
-    return monitor;
-  }
-
   private String mongoAggregateCollection() {
     return fullType() + environmentSuffix();
   }
@@ -716,10 +720,10 @@ public class Aggregate {
         .orElse(newState);
   }
 
-  private JsonObject reduce(final JsonObject command) {
-    return tryToGetForever(() -> processCommand(command), BACK_OFF, this::logException)
-        .toCompletableFuture()
-        .join();
+  private CompletionStage<Message<String, JsonObject>> reduce(
+      final Message<String, JsonObject> command) {
+    return tryToGetForever(() -> processCommand(command.value), BACK_OFF, this::logException)
+        .thenApply(command::withValue);
   }
 
   private CompletionStage<JsonObject> reduceCommand(final JsonObject command) {
@@ -747,35 +751,25 @@ public class Aggregate {
         : completedFuture(currentState);
   }
 
-  private KStream<String, JsonObject> reducer() {
-    return commandSource()
-        .mapValues(json -> trace(json, j -> true, () -> "Reducing " + string(json)))
-        .mapValues(this::reduce)
-        .mapValues(
-            json ->
-                trace(
-                    json,
-                    j -> true,
-                    () -> "Reduction result: " + (json != null ? string(json) : "null")))
-        .filter((k, v) -> v != null && !v.isEmpty());
-  }
-
-  /**
-   * Returns the reply stream.
-   *
-   * @return The reply stream.
-   * @since 1.0
-   */
-  public KStream<String, JsonObject> replies() {
-    return replies;
-  }
-
-  private void replies(final KStream<String, JsonObject> reducer) {
-    aggregates
-        .flatMapValues(v -> list(v, createAggregateMessage(v)))
-        .merge(errors(reducer))
-        .to(topic(REPLY_TOPIC));
-    replies = builder.stream(topic(REPLY_TOPIC));
+  private Processor<Message<String, JsonObject>, Message<String, JsonObject>> reducer() {
+    return pipe(map(
+            (Message<String, JsonObject> m) ->
+                m.withValue(trace(m.value, j -> true, () -> "Reducing " + string(m.value)))))
+        .then(
+            mapAsync(
+                (Message<String, JsonObject> command, Message<String, JsonObject> previousEvent) ->
+                    reduce(command)))
+        .then(
+            map(
+                m ->
+                    m.withValue(
+                        trace(
+                            m.value,
+                            j -> true,
+                            () ->
+                                "Reduction result: "
+                                    + (m.value != null ? string(m.value) : "null")))))
+        .then(filter(m -> m.value != null && !m.value.isEmpty()));
   }
 
   private CompletionStage<JsonObject> saveReduction(
@@ -795,7 +789,7 @@ public class Aggregate {
     return fullType() + "-" + purpose + environmentSuffix();
   }
 
-  private <T> T trace(final T value, final Predicate<T> test, final Supplier<String> message) {
+  private <V> V trace(final V value, final Predicate<V> test, final Supplier<String> message) {
     if (logger != null && test.test(value)) {
       logger.finest(message);
     }
@@ -811,18 +805,6 @@ public class Aggregate {
    */
   public String type() {
     return type;
-  }
-
-  private void unique() {
-    if (uniqueFunction != null) {
-      final KStream<String, Pair<JsonObject, JsonValue>> applied =
-          commands.mapValues(v -> pair(v, uniqueFunction.apply(v)));
-
-      applied
-          .filter((k, p) -> !p.second.equals(NULL))
-          .map((k, p) -> new KeyValue<>(string(p.second), p.first))
-          .to(topic(UNIQUE_TOPIC));
-    }
   }
 
   private CompletionStage<Boolean> updateMongoAggregate(final JsonObject aggregate) {
@@ -858,7 +840,7 @@ public class Aggregate {
    * @return The aggregate object itself.
    * @since 1.0
    */
-  public Aggregate withApp(final String app) {
+  public Aggregate<T, U> withApp(final String app) {
     this.app = app;
 
     return this;
@@ -871,41 +853,35 @@ public class Aggregate {
    * @return The aggregate object itself.
    * @since 1.0
    */
-  public Aggregate withBreakingTheGlass() {
+  public Aggregate<T, U> withBreakingTheGlass() {
     breakingTheGlass = true;
 
     return this;
   }
 
   /**
-   * Sets the Kafka Streams builder that will be used to create the topology.
+   * Sets the <code>Streams</code> builder that will be used to create the topology.
    *
    * @param builder the given builder.
    * @return The aggregate object itself.
-   * @since 1.0
+   * @since 3.0
    */
-  public Aggregate withBuilder(final StreamsBuilder builder) {
+  public Aggregate<T, U> withBuilder(final Streams<String, JsonObject, T, U> builder) {
     this.builder = builder;
 
     return this;
   }
 
   /**
-   * Sets a function with which a Kafka Stream can be inserted between the command topic and the
-   * reducers. This method can be called several times. The result will be a function that chains
-   * everything in the order of the invocations.
+   * Inserts a processor between the command topic and the reducers.
    *
    * @param commandProcessor the processor.
    * @return The aggregate object itself.
    * @since 1.0
    */
-  public Aggregate withCommandProcessor(final StreamProcessor commandProcessor) {
-    final StreamProcessor previous = this.commandProcessor;
-
-    this.commandProcessor =
-        previous != null
-            ? (s, b) -> commandProcessor.apply(previous.apply(s, b), b)
-            : commandProcessor;
+  public Aggregate<T, U> withCommandProcessor(
+      final Processor<Message<String, JsonObject>, Message<String, JsonObject>> commandProcessor) {
+    this.commandProcessor = commandProcessor;
 
     return this;
   }
@@ -919,7 +895,7 @@ public class Aggregate {
    * @return The aggregate object itself.
    * @since 1.0
    */
-  public Aggregate withEnvironment(final String environment) {
+  public Aggregate<T, U> withEnvironment(final String environment) {
     this.environment = environment;
 
     return this;
@@ -932,7 +908,7 @@ public class Aggregate {
    * @return The aggregate object itself.
    * @since 1.3
    */
-  public Aggregate withLogger(final Logger logger) {
+  public Aggregate<T, U> withLogger(final Logger logger) {
     this.logger = logger;
 
     return this;
@@ -946,7 +922,7 @@ public class Aggregate {
    * @return The aggregate object itself.
    * @since 1.0
    */
-  public Aggregate withMongoDatabase(final MongoDatabase database) {
+  public Aggregate<T, U> withMongoDatabase(final MongoDatabase database) {
     this.database = prepareDatabase(database);
 
     return this;
@@ -960,7 +936,7 @@ public class Aggregate {
    * @return The aggregate object itself.
    * @since 1.0
    */
-  public Aggregate withReducer(final String command, final Reducer reducer) {
+  public Aggregate<T, U> withReducer(final String command, final Reducer reducer) {
     reducers.put(command, reducer);
 
     return this;
@@ -974,7 +950,7 @@ public class Aggregate {
    * @return The aggregate object itself.
    * @since 1.0
    */
-  public Aggregate withReducer(final Reducer reducer) {
+  public Aggregate<T, U> withReducer(final Reducer reducer) {
     this.reducer = reducer;
 
     return this;
@@ -987,7 +963,7 @@ public class Aggregate {
    * @return The aggregate object itself.
    * @since 1.0
    */
-  public Aggregate withType(final String type) {
+  public Aggregate<T, U> withType(final String type) {
     this.type = type;
 
     return this;
@@ -996,13 +972,13 @@ public class Aggregate {
   /**
    * When the expression is given it is used on commands to obtain an alternate unique key. This can
    * be used to avoid the creation of duplicates according to some business criterion. The "unique"
-   * Kafka topic must exist in this case.
+   * topic must exist in this case.
    *
    * @param expression a MongoDB expression.
    * @return The aggregate object itself.
    * @since 1.2
    */
-  public Aggregate withUniqueExpression(final JsonValue expression) {
+  public Aggregate<T, U> withUniqueExpression(final JsonValue expression) {
     uniqueExpression = expression;
     uniqueFunction = function(expression);
 

@@ -1,11 +1,10 @@
 {
   "_id": "ebb689bd-3038-4f31-88cd-ad2baa40ae9a",
-  "_corr": "5c60b438-7ba1-4358-97d9-3510cb251ff9",
+  "_corr": "4b22b5f9-88d5-403d-a84b-d18af4a890be",
   "_type": "test-test",
   "_command": "unknown",
   "_jwt": {
     "sub": "system"
   },
-  "value": 0,
   "unique": 0
 }

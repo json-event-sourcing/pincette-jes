@@ -1,6 +1,6 @@
 {
-  "_id": "ebb689bd-3038-4f31-88cd-ad2baa40ae9a",
-  "_corr": "5c60b438-7ba1-4358-97d9-3510cb251ff9",
+  "_id": "ef7c7fe9-dd26-4bb2-876a-fd10c7c23db0",
+  "_corr": "62c8143f-1840-4fd1-ae45-f6bed7a627e4",
   "_type": "test-test",
   "_seq": 0,
   "_jwt": {
@@ -15,5 +15,5 @@
     ]
   },
   "value": 0,
-  "unique": 0
+  "unique": 2
 }

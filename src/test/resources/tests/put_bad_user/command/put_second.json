@@ -1,6 +1,6 @@
 {
-  "_id": "f3b43ce3-f435-4504-863d-409a6536108d",
-  "_corr": "a8fe8064-24dc-4562-8883-02f3778e3628",
+  "_id": "ef7c7fe9-dd26-4bb2-876a-fd10c7c23db0",
+  "_corr": "b9187c86-2133-49ce-b653-96d90d0575d3",
   "_type": "test-test",
   "_command": "put",
   "_jwt": {
@@ -10,5 +10,5 @@
     ]
   },
   "value": 0,
-  "unique": 0
+  "unique": 2
 }

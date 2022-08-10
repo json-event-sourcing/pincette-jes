@@ -1,6 +1,6 @@
 {
-  "_id": "ebb689bd-3038-4f31-88cd-ad2baa40ae9a",
-  "_corr": "5c60b438-7ba1-4358-97d9-3510cb251ff9",
+  "_id": "1b48eb99-c7a2-42a1-9c42-a25c31447d70",
+  "_corr": "6a2a784b-5eda-40a5-a555-1f5343f8fa4d",
   "_type": "test-test",
   "_command": "put",
   "_jwt": {
@@ -16,7 +16,7 @@
     {
       "op": "add",
       "path": "/unique",
-      "value": 0
+      "value": 3
     },
     {
       "op": "add",
