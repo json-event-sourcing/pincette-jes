@@ -513,7 +513,13 @@ public class Aggregate {
   }
 
   private KStream<String, JsonObject> commandSource() {
-    return uniqueFunction != null ? builder.stream(topic(UNIQUE_TOPIC)) : commands;
+    if (uniqueFunction != null) {
+      final KStream<String, JsonObject> com = builder.stream(topic(UNIQUE_TOPIC));
+
+      return com.filter((k, v) -> isCommand(v));
+    }
+
+    return commands;
   }
 
   /**
