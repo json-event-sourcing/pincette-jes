@@ -19,8 +19,8 @@ import static net.pincette.json.JsonUtil.createObjectBuilder;
 import static net.pincette.json.JsonUtil.getArray;
 import static net.pincette.json.JsonUtil.getBoolean;
 import static net.pincette.json.JsonUtil.getString;
-import static net.pincette.util.Builder.create;
 import static net.pincette.util.Collections.intersection;
+import static net.pincette.util.ImmutableBuilder.create;
 import static net.pincette.util.Or.tryWith;
 
 import java.util.Optional;

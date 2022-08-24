@@ -578,7 +578,7 @@ public class Aggregate<T, U> {
         ? builder
             .from(topic(COMMAND_TOPIC), unique(uniqueFunction))
             .to(topic(UNIQUE_TOPIC))
-            .from(topic(UNIQUE_TOPIC), commands)
+            .from(topic(UNIQUE_TOPIC), box(filter(m -> isCommand(m.value)), commands))
         : builder.from(topic(COMMAND_TOPIC), commands);
   }
 
@@ -668,7 +668,7 @@ public class Aggregate<T, U> {
 
   private void logException(final Throwable e) {
     if (logger != null) {
-      logger.log(SEVERE, e.getMessage(), e);
+      logger.log(SEVERE, e, () -> type() + ": " + e.getMessage());
     }
   }
 
