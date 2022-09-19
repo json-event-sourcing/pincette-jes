@@ -4,8 +4,10 @@ import static java.lang.Integer.MAX_VALUE;
 import static java.util.Optional.ofNullable;
 import static java.util.UUID.randomUUID;
 import static java.util.concurrent.CompletableFuture.completedFuture;
+import static java.util.logging.LogManager.getLogManager;
 import static java.util.logging.Logger.getLogger;
 import static java.util.stream.Collectors.toList;
+import static java.util.stream.Collectors.toSet;
 import static net.pincette.jes.Commands.GET;
 import static net.pincette.jes.Commands.PUT;
 import static net.pincette.jes.JsonFields.ACL_WRITE;
@@ -36,6 +38,7 @@ import static net.pincette.util.Collections.merge;
 import static net.pincette.util.Collections.set;
 import static net.pincette.util.Or.tryWith;
 import static net.pincette.util.Pair.pair;
+import static net.pincette.util.Util.tryToDoRethrow;
 import static net.pincette.util.Util.tryToDoWithRethrow;
 import static net.pincette.util.Util.tryToGetRethrow;
 import static net.pincette.util.Util.tryToGetWithRethrow;
@@ -73,6 +76,7 @@ import javax.json.JsonReader;
 import net.pincette.kafka.json.JsonDeserializer;
 import net.pincette.kafka.json.JsonSerializer;
 import net.pincette.rs.Source;
+import net.pincette.rs.kafka.ConsumerEvent;
 import net.pincette.rs.streams.Message;
 import net.pincette.rs.streams.Streams;
 import org.apache.kafka.clients.admin.Admin;
@@ -84,6 +88,7 @@ import org.apache.kafka.clients.producer.ProducerRecord;
 import org.apache.kafka.common.serialization.StringDeserializer;
 import org.apache.kafka.common.serialization.StringSerializer;
 import org.junit.jupiter.api.AfterAll;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
 
@@ -121,13 +126,17 @@ class Base {
   private static final Set<String> TOPICS =
       set(COMMAND, EVENT, EVENT_FULL, AGGREGATE, REPLY, UNIQUE);
 
+  static {
+    tryToDoRethrow(
+        () ->
+            getLogManager()
+                .readConfiguration(Base.class.getResourceAsStream("/logging.properties")));
+  }
+
   protected static Resources resources;
 
   @AfterAll
-  public static void after() {
-    deleteTopics(null);
-    deleteTopics("dev");
-    cleanUpCollections();
+  public static void afterAll() {
     resources.close();
   }
 
@@ -168,8 +177,6 @@ class Base {
   @BeforeAll
   public static void beforeAll() {
     resources = new Resources();
-    createTopics(null);
-    createTopics("dev");
   }
 
   private static void cleanUpCollections() {
@@ -216,8 +223,11 @@ class Base {
     tryToDoWithRethrow(
         () -> Admin.create(COMMON_CONFIG),
         admin ->
-            admin.createTopics(
-                TOPICS.stream().map(name -> newTopic(name, environment)).collect(toList())));
+            net.pincette.rs.kafka.Util.createTopics(
+                    TOPICS.stream().map(name -> newTopic(name, environment)).collect(toSet()),
+                    admin)
+                .toCompletableFuture()
+                .join());
   }
 
   private static Streams<
@@ -227,15 +237,25 @@ class Base {
           ProducerRecord<String, JsonObject>>
       createStreams() {
     return Streams.streams(
-        fromPublisher(publisher(Base::consumer)), fromSubscriber(subscriber(Base::producer)));
+        fromPublisher(
+            publisher(Base::consumer)
+                .withEventHandler(
+                    (event, consumer) -> {
+                      if (event == ConsumerEvent.STARTED) {
+                        consumer.seekToBeginning(consumer.assignment());
+                      }
+                    })),
+        fromSubscriber(subscriber(Base::producer)));
   }
 
   private static void deleteTopics(final String environment) {
     tryToDoWithRethrow(
         () -> Admin.create(COMMON_CONFIG),
         admin ->
-            admin.deleteTopics(
-                TOPICS.stream().map(name -> topic(name, environment)).collect(toList())));
+            net.pincette.rs.kafka.Util.deleteTopics(
+                    TOPICS.stream().map(name -> topic(name, environment)).collect(toSet()), admin)
+                .toCompletableFuture()
+                .join());
   }
 
   private static void drop(final String collection) {
@@ -336,9 +356,20 @@ class Base {
                 }));
   }
 
+  @AfterEach
+  public void afterEach() {
+    cleanUpCollections();
+    deleteTopics(null);
+    deleteTopics("dev");
+  }
+
   @BeforeEach
   public void beforeEach() {
     cleanUpCollections();
+    deleteTopics(null);
+    deleteTopics("dev");
+    createTopics(null);
+    createTopics("dev");
   }
 
   protected void runTest(final String name) {
