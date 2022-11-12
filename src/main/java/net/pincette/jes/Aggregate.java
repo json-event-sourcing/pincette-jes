@@ -540,21 +540,27 @@ public class Aggregate<T, U> {
     must(app != null && builder != null && type != null && database != null);
     aggregateCollection = database.getCollection(mongoAggregateCollection());
 
+    final Processor<Message<String, JsonObject>, Message<String, JsonObject>> aggregates =
+        aggregates();
     final Processor<Message<String, JsonObject>, Message<String, JsonObject>> errors = errors();
+    final Processor<Message<String, JsonObject>, Message<String, JsonObject>> events = events();
     final Processor<Message<String, JsonObject>, Message<String, JsonObject>> eventsFull =
         eventsFull();
+    final Processor<Message<String, JsonObject>, Message<String, JsonObject>> eventsFullPass =
+        passThrough();
+    final Processor<Message<String, JsonObject>, Message<String, JsonObject>> replies =
+        aggregates();
+
+    eventsFull.subscribe(Fanout.of(aggregates, events, eventsFullPass, replies));
 
     return commandSource(createCommands())
         .process(reducer())
         .subscribe(Fanout.of(eventsFull, errors))
-        .to(topic(EVENT_FULL_TOPIC), eventsFull)
+        .to(topic(EVENT_FULL_TOPIC), eventsFullPass)
         .to(topic(REPLY_TOPIC), errors)
-        .from(topic(EVENT_FULL_TOPIC), aggregates())
-        .to(topic(AGGREGATE_TOPIC))
-        .from(topic(EVENT_FULL_TOPIC), events())
-        .to(topic(EVENT_TOPIC))
-        .from(topic(AGGREGATE_TOPIC), passThrough())
-        .to(topic(REPLY_TOPIC));
+        .to(topic(REPLY_TOPIC), replies)
+        .to(topic(AGGREGATE_TOPIC), aggregates)
+        .to(topic(EVENT_TOPIC), events);
   }
 
   private String cacheKey(final JsonObject command) {
