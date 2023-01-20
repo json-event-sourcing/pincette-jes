@@ -40,9 +40,6 @@
     "_corr": "c264885b-68a0-4d56-ba31-51c9b7269c38",
     "_type": "test-test",
     "_seq": 0,
-    "_jwt": {
-      "sub": "system"
-    },
     "_acl": {
       "get": [
         "test"

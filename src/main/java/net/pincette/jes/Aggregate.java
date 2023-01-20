@@ -300,20 +300,12 @@ public class Aggregate<T, U> {
   }
 
   private static JsonObjectBuilder createAfter(
-      final JsonObject newState,
-      final JsonObject command,
-      final String corr,
-      final int seq,
-      final long now) {
-    return create(
-            () ->
-                createObjectBuilder(newState)
-                    .add(CORR, corr)
-                    .add(SEQ, seq)
-                    .add(TIMESTAMP, now)
-                    .remove(JWT))
-        .updateIf(b -> command.containsKey(JWT), b -> b.add(JWT, command.getJsonObject(JWT)))
-        .build();
+      final JsonObject newState, final String corr, final int seq, final long now) {
+    return createObjectBuilder(newState)
+        .add(CORR, corr)
+        .add(SEQ, seq)
+        .add(TIMESTAMP, now)
+        .remove(JWT);
   }
 
   private static JsonObject createEvent(
@@ -335,7 +327,7 @@ public class Aggregate<T, U> {
                     .add(COMMAND, command.getString(COMMAND))
                     .add(TIMESTAMP, now)
                     .add(BEFORE, oldState)
-                    .add(AFTER, createAfter(newState, command, corr, seq, now))
+                    .add(AFTER, createAfter(newState, corr, seq, now))
                     .add(OPS, ops))
         .updateIf(
             b -> command.containsKey(LANGUAGES),

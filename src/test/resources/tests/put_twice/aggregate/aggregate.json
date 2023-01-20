@@ -3,9 +3,6 @@
   "_corr": "971f06ff-1545-4315-a04e-239563e4dc09",
   "_type": "test-test",
   "_seq": 0,
-  "_jwt": {
-    "sub": "system"
-  },
   "_acl": {
     "get": [
       "test"
