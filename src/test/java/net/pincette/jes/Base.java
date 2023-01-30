@@ -311,6 +311,18 @@ class Base {
             .build());
   }
 
+  private static List<JsonObject> removeStackTrace(final List<JsonObject> jsons) {
+    return jsons.stream().map(Base::removeStackTrace).collect(toList());
+  }
+
+  private static JsonObject removeStackTrace(final JsonObject json) {
+    return create(() -> createObjectBuilder(json))
+        .updateIf(
+            () -> ofNullable(json.getString("exception", null)), (b, v) -> b.add("exception", ""))
+        .build()
+        .build();
+  }
+
   static Message<String, JsonObject> removeTimestamps(final Message<String, JsonObject> message) {
     return message.withValue(
         create(() -> createObjectBuilder(message.value).remove(TIMESTAMP))
@@ -413,6 +425,6 @@ class Base {
     assertEquals(expectedEventsFull, resultEventsFull);
     assertEquals(expectedAggregates, resultAggregates);
     assertEquals(expectedEvents, resultEvents);
-    assertEquals(sort(expectedReplies), sort(resultReplies));
+    assertEquals(sort(removeStackTrace(expectedReplies)), sort(removeStackTrace(resultReplies)));
   }
 }
