@@ -63,7 +63,9 @@ import static net.pincette.util.Collections.list;
 import static net.pincette.util.Collections.set;
 import static net.pincette.util.Or.tryWith;
 import static net.pincette.util.Pair.pair;
+import static net.pincette.util.Util.getStackTrace;
 import static net.pincette.util.Util.must;
+import static net.pincette.util.Util.tryToGet;
 import static net.pincette.util.Util.tryToGetForever;
 
 import com.mongodb.ReadConcern;
@@ -216,6 +218,8 @@ public class Aggregate<T, U> {
   private static final Duration DUPLICATE_WINDOW = ofSeconds(60);
   private static final String EVENT_TOPIC = "event";
   private static final String EVENT_FULL_TOPIC = "event-full";
+  private static final String EXCEPTION = "exception";
+  private static final String MESSAGE = "message";
   private static final Bson NOT_DELETED = ne(DELETED, true);
   private static final String REDUCER_COMMAND = "command";
   private static final String REDUCER_STATE = "state";
@@ -256,7 +260,7 @@ public class Aggregate<T, U> {
     return createObjectBuilder(command)
         .add(ERROR, true)
         .add(STATUS_CODE, 403)
-        .add("message", "Forbidden")
+        .add(MESSAGE, "Forbidden")
         .build();
   }
 
@@ -267,7 +271,14 @@ public class Aggregate<T, U> {
   private static Processor<Message<String, JsonObject>, Message<String, JsonObject>> aggregates() {
     return box(
         filter((Message<String, JsonObject> m) -> isEvent(m.value) && m.value.containsKey(AFTER)),
-        map(m -> m.withValue(m.value.getJsonObject(AFTER))));
+        map(
+            m ->
+                m.withValue(
+                    create(() -> createObjectBuilder(m.value.getJsonObject(AFTER)))
+                        .updateIf(
+                            () -> ofNullable(m.value.getJsonObject(JWT)), (b, v) -> b.add(JWT, v))
+                        .build()
+                        .build())));
   }
 
   private static Optional<JsonObject> beforeWithoutTechnical(final JsonObject event) {
@@ -369,6 +380,10 @@ public class Aggregate<T, U> {
 
   private static Processor<Message<String, JsonObject>, Message<String, JsonObject>> eventsFull() {
     return filter(m -> isEvent(m.value));
+  }
+
+  private static JsonObject exception(final JsonObject command, final Throwable e) {
+    return createObjectBuilder(command).add(ERROR, true).add(EXCEPTION, getStackTrace(e)).build();
   }
 
   private static JsonObject idsToLowerCase(final JsonObject json) {
@@ -486,7 +501,7 @@ public class Aggregate<T, U> {
     return createObjectBuilder(command)
         .add(ERROR, true)
         .add(STATUS_CODE, 400)
-        .add("message", "Missing unique expression fields")
+        .add(MESSAGE, "Missing unique expression fields")
         .build();
   }
 
@@ -614,13 +629,18 @@ public class Aggregate<T, U> {
 
   private CompletionStage<JsonObject> executeReducer(
       final JsonObject command, final JsonObject currentState) {
-    return Optional.ofNullable(reducer)
-        .map(red -> red.apply(command, currentState))
-        .orElseGet(
+    return tryToGet(
             () ->
-                Optional.ofNullable(reducers.get(command.getString(COMMAND)))
+                Optional.ofNullable(reducer)
                     .map(red -> red.apply(command, currentState))
-                    .orElseGet(() -> completedFuture(currentState)));
+                    .orElseGet(
+                        () ->
+                            Optional.ofNullable(reducers.get(command.getString(COMMAND)))
+                                .map(red -> red.apply(command, currentState))
+                                .orElseGet(() -> completedFuture(currentState)))
+                    .exceptionally(e -> exception(command, e)),
+            e -> completedFuture(exception(command, e)))
+        .orElse(null);
   }
 
   /**
@@ -704,6 +724,7 @@ public class Aggregate<T, U> {
                           if (isEvent(result)) {
                             aggregateCache.put(cacheKey(command), result.getJsonObject(AFTER));
                           }
+
                           return result;
                         }));
   }

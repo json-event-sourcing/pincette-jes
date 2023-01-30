@@ -5,6 +5,20 @@ import org.junit.jupiter.api.Test;
 
 class TestAggregate extends Base {
   @Test
+  @DisplayName("patch")
+  void patch() {
+    runTest("patch");
+    runTest("patch", "dev");
+  }
+
+  @Test
+  @DisplayName("patch_bad")
+  void patchBad() {
+    runTest("patch_bad");
+    runTest("patch_bad", "dev");
+  }
+
+  @Test
   @DisplayName("plusminus")
   void plusminus() {
     runTest("plusminus");

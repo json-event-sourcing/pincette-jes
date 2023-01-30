@@ -9,6 +9,7 @@ import static java.util.logging.Logger.getLogger;
 import static java.util.stream.Collectors.toList;
 import static java.util.stream.Collectors.toSet;
 import static net.pincette.jes.Commands.GET;
+import static net.pincette.jes.Commands.PATCH;
 import static net.pincette.jes.Commands.PUT;
 import static net.pincette.jes.JsonFields.ACL_WRITE;
 import static net.pincette.jes.JsonFields.AFTER;
@@ -160,6 +161,7 @@ class Base {
         .withEnvironment(environment)
         .withBuilder(streams)
         .withLogger(getLogger("net.pincette.jes.test"))
+        .withReducer(PATCH, Aggregate::patch)
         .withReducer(PLUS, (command, currentState) -> reduce(currentState, v -> v + 1))
         .withReducer(MINUS, (command, currentState) -> reduce(currentState, v -> v - 1))
         .withReducer(

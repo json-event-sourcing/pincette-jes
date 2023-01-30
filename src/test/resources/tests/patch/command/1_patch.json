@@ -2,18 +2,16 @@
   "_id": "0a5f18a5-70b7-4515-a0f4-b60179540349",
   "_corr": "c264885b-68a0-4d56-ba31-51c9b7269c38",
   "_type": "test-test",
-  "_seq": 0,
-  "_acl": {
-    "get": [
-      "test"
-    ],
-    "write": [
-      "test"
-    ]
-  },
-  "value": 0,
-  "unique": 1,
+  "_command": "patch",
   "_jwt": {
     "sub": "system"
-  }
+  },
+  "unique": 0,
+  "_ops": [
+    {
+      "op": "replace",
+      "path": "/value",
+      "value": 1
+    }
+  ]
 }

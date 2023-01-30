@@ -12,5 +12,8 @@
     ]
   },
   "value": 1,
-  "unique": 0
+  "unique": 0,
+  "_jwt": {
+    "sub": "system"
+  }
 }

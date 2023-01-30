@@ -1,0 +1,19 @@
+{
+  "_id": "0a5f18a5-70b7-4515-a0f4-b60179540349",
+  "_corr": "c264885b-68a0-4d56-ba31-51c9b7269c38",
+  "_type": "test-test",
+  "_command": "patch",
+  "_jwt": {
+    "sub": "system"
+  },
+  "unique": 0,
+  "_ops": [
+    {
+      "op": "replace",
+      "path": "/val",
+      "value": 1
+    }
+  ],
+  "_error": true,
+  "exception": "javax.json.JsonException: Non-existing name/value pair in the object for key val\n\tat org.glassfish.json.NodeReference$ObjectReference.replace(NodeReference.java:242)\n\tat org.glassfish.json.NodeReference$ObjectReference.replace(NodeReference.java:203)\n\tat org.glassfish.json.JsonPointerImpl.execute(JsonPointerImpl.java:234)\n\tat org.glassfish.json.JsonPointerImpl.replace(JsonPointerImpl.java:206)\n\tat org.glassfish.json.JsonPatchImpl.apply(JsonPatchImpl.java:171)\n\tat org.glassfish.json.JsonPatchImpl.apply(JsonPatchImpl.java:136)\n\tat net.pincette.jes.Aggregate.lambda$patch$26(Aggregate.java:424)\n\tat java.base/java.util.Optional.map(Optional.java:260)\n\tat net.pincette.jes.Aggregate.patch(Aggregate.java:424)\n\tat net.pincette.jes.Aggregate.lambda$executeReducer$50(Aggregate.java:639)\n\tat java.base/java.util.Optional.map(Optional.java:260)\n\tat net.pincette.jes.Aggregate.lambda$executeReducer$52(Aggregate.java:639)\n\tat java.base/java.util.Optional.orElseGet(Optional.java:364)\n\tat net.pincette.jes.Aggregate.lambda$executeReducer$54(Aggregate.java:636)\n\tat net.pincette.util.Util.tryToGet(Util.java:1189)\n\tat net.pincette.jes.Aggregate.executeReducer(Aggregate.java:632)\n\tat net.pincette.jes.Aggregate.reduceIfAllowed(Aggregate.java:761)\n\tat net.pincette.jes.Aggregate.reduceIfMatching(Aggregate.java:769)\n\tat net.pincette.jes.Aggregate.lambda$reduceCommand$80(Aggregate.java:755)\n\tat java.base/java.util.concurrent.CompletableFuture$UniCompose.tryFire(CompletableFuture.java:1150)\n\tat java.base/java.util.concurrent.CompletableFuture$Completion.exec(CompletableFuture.java:483)\n\tat java.base/java.util.concurrent.ForkJoinTask.doExec$$$capture(ForkJoinTask.java:373)\n\tat java.base/java.util.concurrent.ForkJoinTask.doExec(ForkJoinTask.java)\n\tat java.base/java.util.concurrent.ForkJoinPool$WorkQueue.topLevelExec(ForkJoinPool.java:1182)\n\tat java.base/java.util.concurrent.ForkJoinPool.scan(ForkJoinPool.java:1655)\n\tat java.base/java.util.concurrent.ForkJoinPool.runWorker(ForkJoinPool.java:1622)\n\tat java.base/java.util.concurrent.ForkJoinWorkerThread.run(ForkJoinWorkerThread.java:165)\n"
+}
