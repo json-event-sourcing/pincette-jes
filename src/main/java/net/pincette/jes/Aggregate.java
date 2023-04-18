@@ -50,7 +50,7 @@ import static net.pincette.mongo.Expression.function;
 import static net.pincette.mongo.JsonClient.findOne;
 import static net.pincette.mongo.JsonClient.update;
 import static net.pincette.mongo.Patch.updateOperators;
-import static net.pincette.rs.AsyncDepend.mapAsync;
+import static net.pincette.rs.Async.mapAsyncSequential;
 import static net.pincette.rs.Box.box;
 import static net.pincette.rs.Filter.filter;
 import static net.pincette.rs.Mapper.map;
@@ -58,6 +58,8 @@ import static net.pincette.rs.NotFilter.notFilter;
 import static net.pincette.rs.PassThrough.passThrough;
 import static net.pincette.rs.Pipe.pipe;
 import static net.pincette.rs.Util.duplicateFilter;
+import static net.pincette.rs.Util.transformAsync;
+import static net.pincette.rs.streams.Message.message;
 import static net.pincette.util.Builder.create;
 import static net.pincette.util.Collections.list;
 import static net.pincette.util.Collections.set;
@@ -211,9 +213,11 @@ import org.bson.conversions.Bson;
  * @since 1.0
  */
 public class Aggregate<T, U> {
+  private static final String AGGREGATE_FIELD = "aggregate";
   private static final String AGGREGATE_TOPIC = "aggregate";
   private static final Duration BACK_OFF = ofSeconds(5);
   private static final Duration CACHE_WINDOW = ofSeconds(60);
+  private static final String COMMAND_FIELD = "command";
   private static final String COMMAND_TOPIC = "command";
   private static final Duration DUPLICATE_WINDOW = ofSeconds(60);
   private static final String EVENT_TOPIC = "event";
@@ -229,7 +233,11 @@ public class Aggregate<T, U> {
       set(COMMAND, CORR, ID, JWT, LANGUAGES, SEQ, TEST, TIMESTAMP, TYPE);
   private static final String UNIQUE_TOPIC = "unique";
 
+  private final Map<String, Processor<Message<String, JsonObject>, Message<String, JsonObject>>>
+      commandProcessors = new HashMap<>();
   private final Map<String, Reducer> reducers = new HashMap<>();
+  private final Map<String, Processor<Message<String, JsonObject>, Message<String, JsonObject>>>
+      reducerProcessors = new HashMap<>();
   private final TimedCache<String, JsonObject> aggregateCache = new TimedCache<>(CACHE_WINDOW);
   private MongoCollection<Document> aggregateCollection;
   private String app;
@@ -303,7 +311,7 @@ public class Aggregate<T, U> {
         ? createObjectBuilder(command)
             .add(
                 TIMESTAMP,
-                Optional.ofNullable(command.getJsonNumber(TIMESTAMP))
+                ofNullable(command.getJsonNumber(TIMESTAMP))
                     .map(JsonNumber::longValue)
                     .orElseGet(() -> now().toEpochMilli()))
             .build()
@@ -394,13 +402,13 @@ public class Aggregate<T, U> {
   }
 
   private static boolean isMatchingCommand(
-      final JsonObject currentState, final JsonObject command) {
+      final JsonObject command, final JsonObject currentState) {
     return Optional.of(command.getInt(SEQ, -1))
         .map(seq -> seq == -1 || seq == currentState.getInt(SEQ, -1))
         .orElse(true);
   }
 
-  private static JsonObject makeManaged(final JsonObject state, final JsonObject command) {
+  private static JsonObject makeManaged(final JsonObject command, final JsonObject state) {
     return create(() -> createObjectBuilder(state))
         .updateIf(b -> !state.containsKey(ID), b -> b.add(ID, command.getString(ID)))
         .updateIf(b -> !state.containsKey(TYPE), b -> b.add(TYPE, command.getString(TYPE)))
@@ -420,7 +428,7 @@ public class Aggregate<T, U> {
   public static CompletionStage<JsonObject> patch(
       final JsonObject command, final JsonObject currentState) {
     return completedFuture(
-        Optional.ofNullable(command.getJsonArray(OPS))
+        ofNullable(command.getJsonArray(OPS))
             .map(ops -> createPatch(ops).apply(currentState))
             .orElse(currentState));
   }
@@ -443,6 +451,16 @@ public class Aggregate<T, U> {
    */
   public static CompletionStage<JsonObject> put(final JsonObject command) {
     return completedFuture(createObjectBuilder(command).remove(COMMAND).build());
+  }
+
+  private static Message<String, JsonObject> reduceProcessorMessage(
+      final JsonObject command, final JsonObject currentState) {
+    return message(
+        command.getString(ID),
+        createObjectBuilder()
+            .add(COMMAND_FIELD, command)
+            .add(AGGREGATE_FIELD, currentState)
+            .build());
   }
 
   /**
@@ -631,16 +649,37 @@ public class Aggregate<T, U> {
       final JsonObject command, final JsonObject currentState) {
     return tryToGet(
             () ->
-                Optional.ofNullable(reducer)
+                ofNullable(reducer)
                     .map(red -> red.apply(command, currentState))
-                    .orElseGet(
-                        () ->
-                            Optional.ofNullable(reducers.get(command.getString(COMMAND)))
-                                .map(red -> red.apply(command, currentState))
-                                .orElseGet(() -> completedFuture(currentState)))
+                    .orElseGet(() -> executeSpecificReducer(command, currentState))
                     .exceptionally(e -> exception(command, e)),
             e -> completedFuture(exception(command, e)))
-        .orElse(null);
+        .orElseGet(() -> completedFuture(null))
+        .thenApply(newState -> processNewState(currentState, newState, command));
+  }
+
+  private CompletionStage<JsonObject> executeReducerProcessor(
+      final JsonObject command,
+      final JsonObject currentState,
+      final Processor<Message<String, JsonObject>, Message<String, JsonObject>> processor) {
+    return transformAsync(processor, reduceProcessorMessage(command, currentState))
+        .thenApply(m -> m.value);
+  }
+
+  private CompletionStage<JsonObject> executeSpecificReducer(
+      final JsonObject command, final JsonObject currentState) {
+    final String name = command.getString(COMMAND);
+
+    return preprocessCommand(command)
+        .thenComposeAsync(
+            c ->
+                tryWith(() -> ofNullable(reducers.get(name)).map(red -> red.apply(c, currentState)))
+                    .or(
+                        () ->
+                            ofNullable(reducerProcessors.get(name))
+                                .map(p -> executeReducerProcessor(c, currentState, p)))
+                    .get()
+                    .orElseGet(() -> completedFuture(currentState)));
   }
 
   /**
@@ -657,7 +696,8 @@ public class Aggregate<T, U> {
     return aggregateCache
         .get(cacheKey(command))
         .map(currentState -> (CompletionStage<JsonObject>) completedFuture(currentState))
-        .orElseGet(() -> getMongoCurrentState(command));
+        .orElseGet(() -> getMongoCurrentState(command))
+        .thenApply(state -> makeManaged(command, state));
   }
 
   private CompletionStage<JsonObject> getMongoCurrentState(final JsonObject command) {
@@ -678,7 +718,7 @@ public class Aggregate<T, U> {
         .orElseGet(() -> completedFuture(reduction));
   }
 
-  private JsonObject keepId(final JsonObject currentState, final JsonObject command) {
+  private JsonObject keepId(final JsonObject command, final JsonObject currentState) {
     return uniqueFunction != null
         ? createObjectBuilder(command).add(ID, currentState.getString(ID)).build()
         : command;
@@ -714,24 +754,20 @@ public class Aggregate<T, U> {
                     .build()));
   }
 
-  private CompletionStage<JsonObject> processCommand(final JsonObject command) {
-    return reduceCommand(command)
-        .thenComposeAsync(
-            newState ->
-                saveReduction(newState, this::handleAggregate)
-                    .thenApply(
-                        result -> {
-                          if (isEvent(result)) {
-                            aggregateCache.put(cacheKey(command), result.getJsonObject(AFTER));
-                          }
+  private CompletionStage<JsonObject> preprocessCommand(final JsonObject command) {
+    return ofNullable(commandProcessors.get(command.getString(COMMAND)))
+        .map(
+            p -> transformAsync(p, message(command.getString(ID), command)).thenApply(m -> m.value))
+        .orElseGet(() -> completedFuture(command));
+  }
 
-                          return result;
-                        }));
+  private CompletionStage<JsonObject> processCommand(final JsonObject command) {
+    return reduceCommand(command).thenComposeAsync(newState -> save(command, newState));
   }
 
   private JsonObject processNewState(
       final JsonObject oldState, final JsonObject newState, final JsonObject command) {
-    return Optional.ofNullable(newState)
+    return ofNullable(newState)
         .filter(state -> !hasError(state))
         .map(state -> createOps(oldState, newState))
         .filter(ops -> !ops.isEmpty())
@@ -750,23 +786,20 @@ public class Aggregate<T, U> {
 
     return hasError(checked)
         ? completedFuture(checked)
-        : getCurrentState(command)
-            .thenApply(state -> makeManaged(state, command))
-            .thenComposeAsync(state -> reduceIfMatching(state, command));
+        : getCurrentState(command).thenComposeAsync(state -> reduceIfMatching(command, state));
   }
 
   private CompletionStage<JsonObject> reduceIfAllowed(
-      final JsonObject currentState, final JsonObject command) {
+      final JsonObject command, final JsonObject currentState) {
     return isAllowed(currentState, command, breakingTheGlass)
         ? executeReducer(command, currentState)
-            .thenApply(newState -> processNewState(currentState, newState, command))
         : completedFuture(accessError(command));
   }
 
   private CompletionStage<JsonObject> reduceIfMatching(
-      final JsonObject currentState, final JsonObject command) {
-    return isMatchingCommand(currentState, command)
-        ? reduceIfAllowed(currentState, keepId(currentState, command))
+      final JsonObject command, final JsonObject currentState) {
+    return isMatchingCommand(command, currentState)
+        ? reduceIfAllowed(keepId(command, currentState), currentState)
         : completedFuture(currentState);
   }
 
@@ -775,9 +808,9 @@ public class Aggregate<T, U> {
             (Message<String, JsonObject> m) ->
                 m.withValue(trace(m.value, j -> true, () -> "Reducing " + string(m.value)))))
         .then(
-            mapAsync(
-                (Message<String, JsonObject> command, Message<String, JsonObject> previousEvent) ->
-                    reduce(command)))
+            // AsyncDepend is use here because we don't want the function calls to start in
+            // parallel.
+            mapAsyncSequential(this::reduce))
         .then(
             map(
                 m ->
@@ -789,6 +822,18 @@ public class Aggregate<T, U> {
                                 "Reduction result: "
                                     + (m.value != null ? string(m.value) : "null")))))
         .then(filter(m -> m.value != null && !m.value.isEmpty()));
+  }
+
+  private CompletionStage<JsonObject> save(final JsonObject command, final JsonObject newState) {
+    return saveReduction(newState, this::handleAggregate)
+        .thenApply(
+            result -> {
+              if (isEvent(result)) {
+                aggregateCache.put(cacheKey(command), result.getJsonObject(AFTER));
+              }
+
+              return result;
+            });
   }
 
   private CompletionStage<JsonObject> saveReduction(
@@ -906,6 +951,23 @@ public class Aggregate<T, U> {
   }
 
   /**
+   * Inserts a processor between the command topic and a specific reducer. If there also is a
+   * general preprocessor, then it will come before it.
+   *
+   * @param command the name of the command.
+   * @param commandProcessor the processor.
+   * @return The aggregate object itself.
+   * @since 3.1
+   */
+  public Aggregate<T, U> withCommandProcessor(
+      final String command,
+      final Processor<Message<String, JsonObject>, Message<String, JsonObject>> commandProcessor) {
+    commandProcessors.put(command, commandProcessor);
+
+    return this;
+  }
+
+  /**
    * Sets the environment in which this aggregate will live. The default is <code>dev</code>. It
    * will become the suffix for all the topic names. Typically the value for this comes from an
    * external configuration.
@@ -957,6 +1019,24 @@ public class Aggregate<T, U> {
    */
   public Aggregate<T, U> withReducer(final String command, final Reducer reducer) {
     reducers.put(command, reducer);
+
+    return this;
+  }
+
+  /**
+   * Sets the reducer for the given command. The processor will receive messages with the <code>
+   * command</code> and <code>aggregate</code> fields. It should produce the new aggregate. The ID
+   * of the messages is the aggregate ID.
+   *
+   * @param command the name of the command, which will match the <code>_command</code> field.
+   * @param reducer the reducer processor.
+   * @return The aggregate object itself.
+   * @since 3.1
+   */
+  public Aggregate<T, U> withReducer(
+      final String command,
+      final Processor<Message<String, JsonObject>, Message<String, JsonObject>> reducer) {
+    reducerProcessors.put(command, reducer);
 
     return this;
   }

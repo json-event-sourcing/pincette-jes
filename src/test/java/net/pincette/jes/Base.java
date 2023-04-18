@@ -27,6 +27,7 @@ import static net.pincette.json.JsonUtil.createReader;
 import static net.pincette.json.JsonUtil.createValue;
 import static net.pincette.rs.Chain.with;
 import static net.pincette.rs.LambdaSubscriber.lambdaSubscriber;
+import static net.pincette.rs.Mapper.map;
 import static net.pincette.rs.Reducer.forEachJoin;
 import static net.pincette.rs.kafka.KafkaPublisher.publisher;
 import static net.pincette.rs.kafka.KafkaSubscriber.subscriber;
@@ -66,6 +67,7 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.CompletionStage;
+import java.util.concurrent.Flow.Processor;
 import java.util.concurrent.Flow.Publisher;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Consumer;
@@ -153,26 +155,36 @@ class Base {
                   ConsumerRecord<String, JsonObject>,
                   ProducerRecord<String, JsonObject>>
               streams,
-          final String environment) {
-    return new Aggregate<ConsumerRecord<String, JsonObject>, ProducerRecord<String, JsonObject>>()
-        .withApp(APP)
-        .withType(TYPE)
-        .withMongoDatabase(resources.database)
-        .withEnvironment(environment)
-        .withBuilder(streams)
-        .withLogger(getLogger("net.pincette.jes.test"))
-        .withReducer(PATCH, Aggregate::patch)
-        .withReducer(PLUS, (command, currentState) -> reduce(currentState, v -> v + 1))
-        .withReducer(MINUS, (command, currentState) -> reduce(currentState, v -> v - 1))
-        .withReducer(
-            PUT,
-            (command, currentState) ->
-                completedFuture(
-                    createObjectBuilder(command)
-                        .remove(JsonFields.COMMAND)
-                        .add(JsonFields.ACL, ACL)
-                        .build()))
-        .withUniqueExpression(createValue("$" + UNIQUE))
+          final String environment,
+          final boolean withProcessor) {
+    final var aggregate =
+        new Aggregate<ConsumerRecord<String, JsonObject>, ProducerRecord<String, JsonObject>>()
+            .withApp(APP)
+            .withType(TYPE)
+            .withMongoDatabase(resources.database)
+            .withEnvironment(environment)
+            .withBuilder(streams)
+            .withLogger(getLogger("net.pincette.jes.test"))
+            .withUniqueExpression(createValue("$" + UNIQUE))
+            .withReducer(PATCH, Aggregate::patch)
+            .withReducer(
+                PUT,
+                (command, currentState) ->
+                    completedFuture(
+                        createObjectBuilder(command)
+                            .remove(JsonFields.COMMAND)
+                            .add(JsonFields.ACL, ACL)
+                            .build()));
+
+    return (withProcessor
+            ? aggregate
+                .withReducer(PLUS, reduceProcessor(v -> v + 1))
+                .withReducer(MINUS, reduceProcessor(v -> v - 1))
+                .withCommandProcessor(PLUS, map(c -> c))
+                .withCommandProcessor(PATCH, map(c -> c))
+            : aggregate
+                .withReducer(PLUS, (command, currentState) -> reduce(currentState, v -> v + 1))
+                .withReducer(MINUS, (command, currentState) -> reduce(currentState, v -> v - 1)))
         .build();
   }
 
@@ -182,7 +194,7 @@ class Base {
   }
 
   private static void cleanUpCollections() {
-    final String type = fullType();
+    final var type = fullType();
 
     forEachJoin(
         with(toFlowPublisher(resources.database.listCollectionNames()))
@@ -289,6 +301,13 @@ class Base {
         .orElseGet(Collections::emptyList);
   }
 
+  private static JsonObject newState(final JsonObject currentState, final IntUnaryOperator op) {
+    return createObjectBuilder(currentState)
+        .add(VALUE, op.applyAsInt(currentState.getInt(VALUE, 0)))
+        .add(JsonFields.ACL, ACL)
+        .build();
+  }
+
   private static NewTopic newTopic(final String name, final String environment) {
     return new NewTopic(topic(name, environment), 1, (short) 1);
   }
@@ -304,11 +323,12 @@ class Base {
 
   private static CompletionStage<JsonObject> reduce(
       final JsonObject currentState, final IntUnaryOperator op) {
-    return completedFuture(
-        createObjectBuilder(currentState)
-            .add(VALUE, op.applyAsInt(currentState.getInt(VALUE, 0)))
-            .add(JsonFields.ACL, ACL)
-            .build());
+    return completedFuture(newState(currentState, op));
+  }
+
+  private static Processor<Message<String, JsonObject>, Message<String, JsonObject>>
+      reduceProcessor(final IntUnaryOperator op) {
+    return map(m -> m.withValue(newState(m.value.getJsonObject("aggregate"), op)));
   }
 
   private static List<JsonObject> removeStackTrace(final List<JsonObject> jsons) {
@@ -387,10 +407,10 @@ class Base {
   }
 
   protected void runTest(final String name) {
-    runTest(name, null);
+    runTest(name, null, false);
   }
 
-  protected void runTest(final String name, final String environment) {
+  protected void runTest(final String name, final String environment, final boolean withProcessor) {
     final Streams<
             String,
             JsonObject,
@@ -407,7 +427,7 @@ class Base {
     final List<JsonObject> resultReplies = new ArrayList<>();
     final AtomicInteger running = new AtomicInteger(4);
 
-    aggregate(streams, environment)
+    aggregate(streams, environment, withProcessor)
         .to(
             topic(COMMAND, environment),
             Source.of(inputMessages(loadMessages(resource(name, COMMAND)))))
