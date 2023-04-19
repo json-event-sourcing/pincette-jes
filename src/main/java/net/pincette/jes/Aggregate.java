@@ -213,11 +213,9 @@ import org.bson.conversions.Bson;
  * @since 1.0
  */
 public class Aggregate<T, U> {
-  private static final String AGGREGATE_FIELD = "aggregate";
   private static final String AGGREGATE_TOPIC = "aggregate";
   private static final Duration BACK_OFF = ofSeconds(5);
   private static final Duration CACHE_WINDOW = ofSeconds(60);
-  private static final String COMMAND_FIELD = "command";
   private static final String COMMAND_TOPIC = "command";
   private static final Duration DUPLICATE_WINDOW = ofSeconds(60);
   private static final String EVENT_TOPIC = "event";
@@ -458,8 +456,8 @@ public class Aggregate<T, U> {
     return message(
         command.getString(ID),
         createObjectBuilder()
-            .add(COMMAND_FIELD, command)
-            .add(AGGREGATE_FIELD, currentState)
+            .add(REDUCER_COMMAND, command)
+            .add(REDUCER_STATE, currentState)
             .build());
   }
 

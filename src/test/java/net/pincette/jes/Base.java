@@ -328,7 +328,7 @@ class Base {
 
   private static Processor<Message<String, JsonObject>, Message<String, JsonObject>>
       reduceProcessor(final IntUnaryOperator op) {
-    return map(m -> m.withValue(newState(m.value.getJsonObject("aggregate"), op)));
+    return map(m -> m.withValue(newState(m.value.getJsonObject("state"), op)));
   }
 
   private static List<JsonObject> removeStackTrace(final List<JsonObject> jsons) {
