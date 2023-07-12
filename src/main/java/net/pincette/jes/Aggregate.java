@@ -1,9 +1,7 @@
 package net.pincette.jes;
 
-import static com.mongodb.WriteConcern.MAJORITY;
-import static com.mongodb.client.model.Filters.and;
 import static com.mongodb.client.model.Filters.eq;
-import static com.mongodb.client.model.Filters.ne;
+import static java.lang.System.currentTimeMillis;
 import static java.time.Duration.ofSeconds;
 import static java.time.Instant.now;
 import static java.util.Arrays.stream;
@@ -39,7 +37,6 @@ import static net.pincette.json.JsonUtil.createArrayBuilder;
 import static net.pincette.json.JsonUtil.createDiff;
 import static net.pincette.json.JsonUtil.createObjectBuilder;
 import static net.pincette.json.JsonUtil.createPatch;
-import static net.pincette.json.JsonUtil.emptyObject;
 import static net.pincette.json.JsonUtil.getBoolean;
 import static net.pincette.json.JsonUtil.isObject;
 import static net.pincette.json.JsonUtil.string;
@@ -61,7 +58,6 @@ import static net.pincette.rs.Util.duplicateFilter;
 import static net.pincette.rs.Util.transformAsync;
 import static net.pincette.rs.streams.Message.message;
 import static net.pincette.util.Builder.create;
-import static net.pincette.util.Collections.list;
 import static net.pincette.util.Collections.set;
 import static net.pincette.util.Or.tryWith;
 import static net.pincette.util.Pair.pair;
@@ -71,6 +67,7 @@ import static net.pincette.util.Util.tryToGet;
 import static net.pincette.util.Util.tryToGetForever;
 
 import com.mongodb.ReadConcern;
+import com.mongodb.WriteConcern;
 import com.mongodb.bulk.BulkWriteResult;
 import com.mongodb.client.model.BulkWriteOptions;
 import com.mongodb.client.model.UpdateOneModel;
@@ -222,7 +219,6 @@ public class Aggregate<T, U> {
   private static final String EVENT_FULL_TOPIC = "event-full";
   private static final String EXCEPTION = "exception";
   private static final String MESSAGE = "message";
-  private static final Bson NOT_DELETED = ne(DELETED, true);
   private static final String REDUCER_COMMAND = "command";
   private static final String REDUCER_STATE = "state";
   private static final String REPLY_TOPIC = "reply";
@@ -268,10 +264,6 @@ public class Aggregate<T, U> {
         .add(STATUS_CODE, 403)
         .add(MESSAGE, "Forbidden")
         .build();
-  }
-
-  private static Bson addNotDeleted(final Bson query) {
-    return and(list(query, NOT_DELETED));
   }
 
   private static Processor<Message<String, JsonObject>, Message<String, JsonObject>> aggregates() {
@@ -436,7 +428,7 @@ public class Aggregate<T, U> {
   }
 
   private static MongoDatabase prepareDatabase(final MongoDatabase database) {
-    return database.withReadConcern(ReadConcern.LINEARIZABLE).withWriteConcern(MAJORITY);
+    return database.withReadConcern(ReadConcern.MAJORITY).withWriteConcern(WriteConcern.MAJORITY);
   }
 
   /**
@@ -700,11 +692,7 @@ public class Aggregate<T, U> {
 
   private CompletionStage<JsonObject> getMongoCurrentState(final JsonObject command) {
     return findOne(aggregateCollection, mongoStateCriterion(command))
-        .thenComposeAsync(
-            currentState ->
-                currentState
-                    .map(state -> (CompletionStage<JsonObject>) completedFuture(state))
-                    .orElseGet(() -> completedFuture(emptyObject())));
+        .thenApply(currentState -> currentState.orElseGet(JsonUtil::emptyObject));
   }
 
   private CompletionStage<JsonObject> handleAggregate(final JsonObject reduction) {
@@ -740,16 +728,15 @@ public class Aggregate<T, U> {
   }
 
   private Bson mongoStateQuery(final JsonValue value) {
-    return addNotDeleted(
-        fromJson(
-            isObject(value)
-                ? value.asJsonObject()
-                : createObjectBuilder()
-                    .add(
-                        "$expr",
-                        createObjectBuilder()
-                            .add("$eq", createArrayBuilder().add(uniqueExpression).add(value)))
-                    .build()));
+    return fromJson(
+        isObject(value)
+            ? value.asJsonObject()
+            : createObjectBuilder()
+                .add(
+                    "$expr",
+                    createObjectBuilder()
+                        .add("$eq", createArrayBuilder().add(uniqueExpression).add(value)))
+                .build());
   }
 
   private CompletionStage<JsonObject> preprocessCommand(final JsonObject command) {
@@ -853,7 +840,7 @@ public class Aggregate<T, U> {
 
   private <V> V trace(final V value, final Predicate<V> test, final Supplier<String> message) {
     if (logger != null && test.test(value)) {
-      logger.finest(message);
+      logger.finest(() -> currentTimeMillis() + " " + message.get());
     }
 
     return value;
