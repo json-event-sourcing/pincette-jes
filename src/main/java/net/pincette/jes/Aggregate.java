@@ -51,9 +51,11 @@ import static net.pincette.rs.Async.mapAsyncSequential;
 import static net.pincette.rs.Box.box;
 import static net.pincette.rs.Filter.filter;
 import static net.pincette.rs.Mapper.map;
+import static net.pincette.rs.NeverCancel.neverCancel;
 import static net.pincette.rs.NotFilter.notFilter;
 import static net.pincette.rs.PassThrough.passThrough;
 import static net.pincette.rs.Pipe.pipe;
+import static net.pincette.rs.Util.asValue;
 import static net.pincette.rs.Util.duplicateFilter;
 import static net.pincette.rs.Util.transformAsync;
 import static net.pincette.rs.streams.Message.message;
@@ -65,13 +67,17 @@ import static net.pincette.util.Util.getStackTrace;
 import static net.pincette.util.Util.must;
 import static net.pincette.util.Util.tryToGet;
 import static net.pincette.util.Util.tryToGetForever;
+import static org.reactivestreams.FlowAdapters.toFlowPublisher;
 
+import com.mongodb.ClientSessionOptions;
 import com.mongodb.ReadConcern;
 import com.mongodb.WriteConcern;
 import com.mongodb.bulk.BulkWriteResult;
 import com.mongodb.client.model.BulkWriteOptions;
 import com.mongodb.client.model.UpdateOneModel;
 import com.mongodb.client.result.DeleteResult;
+import com.mongodb.reactivestreams.client.ClientSession;
+import com.mongodb.reactivestreams.client.MongoClient;
 import com.mongodb.reactivestreams.client.MongoCollection;
 import com.mongodb.reactivestreams.client.MongoDatabase;
 import java.time.Duration;
@@ -98,7 +104,6 @@ import net.pincette.json.JsonUtil;
 import net.pincette.rs.Fanout;
 import net.pincette.rs.streams.Message;
 import net.pincette.rs.streams.Streams;
-import net.pincette.util.TimedCache;
 import org.bson.Document;
 import org.bson.conversions.Bson;
 
@@ -206,15 +211,14 @@ import org.bson.conversions.Bson;
  *
  * @param <T> the value type for the topic source.
  * @param <U> the value type for the topic sink.
- * @author Werner Donn\u00e9
+ * @author Werner Donné
  * @since 1.0
  */
 public class Aggregate<T, U> {
   private static final String AGGREGATE_TOPIC = "aggregate";
   private static final Duration BACK_OFF = ofSeconds(5);
-  private static final Duration CACHE_WINDOW = ofSeconds(60);
   private static final String COMMAND_TOPIC = "command";
-  private static final Duration DUPLICATE_WINDOW = ofSeconds(60);
+  private static final Duration DUPLICATE_WINDOW = ofSeconds(5);
   private static final String EVENT_TOPIC = "event";
   private static final String EVENT_FULL_TOPIC = "event-full";
   private static final String EXCEPTION = "exception";
@@ -232,16 +236,17 @@ public class Aggregate<T, U> {
   private final Map<String, Reducer> reducers = new HashMap<>();
   private final Map<String, Processor<Message<String, JsonObject>, Message<String, JsonObject>>>
       reducerProcessors = new HashMap<>();
-  private final TimedCache<String, JsonObject> aggregateCache = new TimedCache<>(CACHE_WINDOW);
   private MongoCollection<Document> aggregateCollection;
   private String app;
   private boolean breakingTheGlass;
   private Streams<String, JsonObject, T, U> builder;
+  private MongoClient client;
   private Processor<Message<String, JsonObject>, Message<String, JsonObject>> commandProcessor;
   private MongoDatabase database;
   private String environment;
   private Logger logger;
   private Reducer reducer;
+  private ClientSession session;
   private String type;
   private JsonValue uniqueExpression;
   private Function<JsonObject, JsonValue> uniqueFunction;
@@ -351,6 +356,12 @@ public class Aggregate<T, U> {
             createDiff(removeTechnical(oldState).build(), removeTechnical(newState).build())
                 .toJsonArray())
         .build();
+  }
+
+  private static ClientSession createSession(final MongoClient client) {
+    return asValue(
+        toFlowPublisher(
+            client.startSession(ClientSessionOptions.builder().causallyConsistent(true).build())));
   }
 
   private static JsonObject createSource(final JsonObject command, final JsonObject state) {
@@ -516,7 +527,8 @@ public class Aggregate<T, U> {
   private static CompletionStage<Boolean> updateAggregate(
       final MongoCollection<Document> collection,
       final JsonObject currentState,
-      final JsonObject event) {
+      final JsonObject event,
+      final ClientSession session) {
     final Bson filter = eq(ID, currentState.getString(ID));
     final List<UpdateOneModel<Document>> operators =
         concat(
@@ -530,7 +542,7 @@ public class Aggregate<T, U> {
             .collect(toList());
     final BulkWriteOptions options = new BulkWriteOptions().ordered(true);
 
-    return exec(collection, c -> c.bulkWrite(operators, options))
+    return exec(collection, c -> c.bulkWrite(session, operators, options))
         .thenApply(BulkWriteResult::wasAcknowledged)
         .thenApply(result -> must(result, r -> r));
   }
@@ -552,8 +564,10 @@ public class Aggregate<T, U> {
    * @since 1.0
    */
   public Streams<String, JsonObject, T, U> build() {
-    must(app != null && builder != null && type != null && database != null);
-    aggregateCollection = database.getCollection(mongoAggregateCollection());
+    must(app != null && builder != null && type != null && database != null && client != null);
+    aggregateCollection =
+        ofNullable(database).map(d -> d.getCollection(mongoAggregateCollection())).orElse(null);
+    session = createSession(client);
 
     final Processor<Message<String, JsonObject>, Message<String, JsonObject>> aggregates =
         aggregates();
@@ -576,10 +590,6 @@ public class Aggregate<T, U> {
         .to(topic(REPLY_TOPIC), replies)
         .to(topic(AGGREGATE_TOPIC), aggregates)
         .to(topic(EVENT_TOPIC), events);
-  }
-
-  private String cacheKey(final JsonObject command) {
-    return uniqueFunction != null ? string(commandKey(command)) : command.getString(ID);
   }
 
   private JsonObject checkUnique(final JsonObject command) {
@@ -610,7 +620,7 @@ public class Aggregate<T, U> {
   private CompletionStage<Boolean> deleteMongoAggregate(final JsonObject aggregate) {
     trace(aggregate, a -> true, () -> "Deleting aggregate " + string(aggregate));
 
-    return deleteOne(aggregateCollection, eq(ID, aggregate.getString(ID)))
+    return deleteOne(aggregateCollection, session, eq(ID, aggregate.getString(ID)))
         .thenApply(DeleteResult::wasAcknowledged)
         .thenApply(result -> must(result, r -> r));
   }
@@ -683,15 +693,11 @@ public class Aggregate<T, U> {
   }
 
   private CompletionStage<JsonObject> getCurrentState(final JsonObject command) {
-    return aggregateCache
-        .get(cacheKey(command))
-        .map(currentState -> (CompletionStage<JsonObject>) completedFuture(currentState))
-        .orElseGet(() -> getMongoCurrentState(command))
-        .thenApply(state -> makeManaged(command, state));
+    return getMongoCurrentState(command).thenApply(state -> makeManaged(command, state));
   }
 
   private CompletionStage<JsonObject> getMongoCurrentState(final JsonObject command) {
-    return findOne(aggregateCollection, mongoStateCriterion(command))
+    return findOne(aggregateCollection, session, mongoStateCriterion(command))
         .thenApply(currentState -> currentState.orElseGet(JsonUtil::emptyObject));
   }
 
@@ -747,7 +753,7 @@ public class Aggregate<T, U> {
   }
 
   private CompletionStage<JsonObject> processCommand(final JsonObject command) {
-    return reduceCommand(command).thenComposeAsync(newState -> save(command, newState));
+    return reduceCommand(command).thenComposeAsync(this::save);
   }
 
   private JsonObject processNewState(
@@ -793,7 +799,7 @@ public class Aggregate<T, U> {
             (Message<String, JsonObject> m) ->
                 m.withValue(trace(m.value, j -> true, () -> "Reducing " + string(m.value)))))
         .then(
-            // AsyncDepend is use here because we don't want the function calls to start in
+            // AsyncDepend is used here because we don't want the function calls to start in
             // parallel.
             mapAsyncSequential(this::reduce))
         .then(
@@ -809,16 +815,8 @@ public class Aggregate<T, U> {
         .then(filter(m -> m.value != null && !m.value.isEmpty()));
   }
 
-  private CompletionStage<JsonObject> save(final JsonObject command, final JsonObject newState) {
-    return saveReduction(newState, this::handleAggregate)
-        .thenApply(
-            result -> {
-              if (isEvent(result)) {
-                aggregateCache.put(cacheKey(command), result.getJsonObject(AFTER));
-              }
-
-              return result;
-            });
+  private CompletionStage<JsonObject> save(final JsonObject newState) {
+    return saveReduction(newState, this::handleAggregate);
   }
 
   private CompletionStage<JsonObject> saveReduction(
@@ -859,7 +857,8 @@ public class Aggregate<T, U> {
   private CompletionStage<Boolean> updateMongoAggregate(final JsonObject aggregate) {
     trace(aggregate, a -> true, () -> "Replacing aggregate " + string(aggregate));
 
-    return update(aggregateCollection, aggregate).thenApply(result -> must(result, r -> r));
+    return update(aggregateCollection, aggregate, session)
+        .thenApply(result -> must(result, r -> r));
   }
 
   private Optional<CompletionStage<Boolean>> updateReductionNew(final JsonObject reduction) {
@@ -879,7 +878,8 @@ public class Aggregate<T, U> {
                     () -> "Updating aggregate " + string(reduction.getJsonObject(AFTER))))
         .map(
             before ->
-                updateAggregate(aggregateCollection, reduction.getJsonObject(BEFORE), reduction));
+                updateAggregate(
+                    aggregateCollection, reduction.getJsonObject(BEFORE), reduction, session));
   }
 
   /**
@@ -947,7 +947,7 @@ public class Aggregate<T, U> {
   public Aggregate<T, U> withCommandProcessor(
       final String command,
       final Processor<Message<String, JsonObject>, Message<String, JsonObject>> commandProcessor) {
-    commandProcessors.put(command, commandProcessor);
+    commandProcessors.put(command, box(commandProcessor, neverCancel()));
 
     return this;
   }
@@ -976,6 +976,19 @@ public class Aggregate<T, U> {
    */
   public Aggregate<T, U> withLogger(final Logger logger) {
     this.logger = logger;
+
+    return this;
+  }
+
+  /**
+   * Sets the MongoDB client that is needed to create a session.
+   *
+   * @param client the given client.
+   * @return The aggregate object itself.
+   * @since 4.0
+   */
+  public Aggregate<T, U> withMongoClient(final MongoClient client) {
+    this.client = client;
 
     return this;
   }

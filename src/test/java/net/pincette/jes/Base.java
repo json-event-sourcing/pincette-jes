@@ -162,6 +162,7 @@ class Base {
             .withApp(APP)
             .withType(TYPE)
             .withMongoDatabase(resources.database)
+            .withMongoClient(resources.client)
             .withEnvironment(environment)
             .withBuilder(streams)
             .withLogger(getLogger("net.pincette.jes.test"))

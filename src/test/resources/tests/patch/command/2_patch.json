@@ -1,17 +1,17 @@
 {
   "_id": "0a5f18a5-70b7-4515-a0f4-b60179540349",
-  "_corr": "1e55ef1a-91cf-4b75-8d74-5a202dba6f4f",
+  "_corr": "22b8806d-3c9a-40c4-b397-3a5f075d6603",
   "_type": "test-test",
   "_command": "patch",
   "_jwt": {
     "sub": "system"
   },
-  "_seq": 1,
+  "unique": 0,
   "_ops": [
     {
       "op": "replace",
       "path": "/value",
-      "value": 1
+      "value": 2
     }
   ]
 }
