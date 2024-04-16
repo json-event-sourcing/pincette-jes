@@ -3,7 +3,7 @@ package net.pincette.jes;
 /**
  * Standard fields for aggregates, events and commands.
  *
- * @author Werner Donn\u00e9
+ * @author Werner Donné
  * @since 3.0
  */
 public class JsonFields {

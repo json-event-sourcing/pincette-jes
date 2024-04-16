@@ -31,7 +31,7 @@ import net.pincette.util.Util.GeneralException;
 /**
  * Utilities to work with events.
  *
- * @author Werner Donn\u00e9
+ * @author Werner Donné
  * @since 3.0
  */
 public class Event {

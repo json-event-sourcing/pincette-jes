@@ -33,7 +33,7 @@ import net.pincette.json.JsonUtil;
 /**
  * Some command utilities.
  *
- * @author Werner Donn\u00e9
+ * @author Werner Donné
  * @since 3.0
  */
 public class Command {

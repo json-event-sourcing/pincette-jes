@@ -8,7 +8,6 @@ import static java.util.Arrays.stream;
 import static java.util.Optional.ofNullable;
 import static java.util.concurrent.CompletableFuture.completedFuture;
 import static java.util.logging.Level.SEVERE;
-import static java.util.stream.Collectors.toList;
 import static java.util.stream.Stream.concat;
 import static javax.json.JsonValue.NULL;
 import static net.pincette.jes.Command.hasError;
@@ -539,7 +538,7 @@ public class Aggregate<T, U> {
                         .filter(JsonUtil::isObject)
                         .map(JsonValue::asJsonObject)))
             .map(op -> new UpdateOneModel<Document>(filter, fromJson(op)))
-            .collect(toList());
+            .toList();
     final BulkWriteOptions options = new BulkWriteOptions().ordered(true);
 
     return exec(collection, c -> c.bulkWrite(session, operators, options))

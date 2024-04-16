@@ -7,7 +7,7 @@ import javax.json.JsonObject;
 /**
  * The first argument is the command. The second one is the current state of the aggregate.
  *
- * @author Werner Donn\u00e9
+ * @author Werner Donné
  * @since 1.0
  */
 @FunctionalInterface
