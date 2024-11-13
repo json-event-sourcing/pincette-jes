@@ -6,7 +6,6 @@ import static java.util.UUID.randomUUID;
 import static java.util.concurrent.CompletableFuture.completedFuture;
 import static java.util.logging.LogManager.getLogManager;
 import static java.util.logging.Logger.getLogger;
-import static java.util.stream.Collectors.toList;
 import static java.util.stream.Collectors.toSet;
 import static net.pincette.jes.Commands.GET;
 import static net.pincette.jes.Commands.PATCH;
@@ -287,7 +286,7 @@ class Base {
             m ->
                 message(
                     ofNullable(m.getString(ID, null)).orElseGet(() -> randomUUID().toString()), m))
-        .collect(toList());
+        .toList();
   }
 
   private static List<JsonObject> loadMessages(final String resource) {
@@ -298,7 +297,7 @@ class Base {
         .map(File::listFiles)
         .map(Arrays::stream)
         .map(Stream::sorted)
-        .map(stream -> stream.map(Base::readJson).collect(toList()))
+        .map(stream -> stream.map(Base::readJson).toList())
         .orElseGet(Collections::emptyList);
   }
 
@@ -333,7 +332,7 @@ class Base {
   }
 
   private static List<JsonObject> removeStackTrace(final List<JsonObject> jsons) {
-    return jsons.stream().map(Base::removeStackTrace).collect(toList());
+    return jsons.stream().map(Base::removeStackTrace).toList();
   }
 
   private static JsonObject removeStackTrace(final JsonObject json) {
@@ -362,7 +361,7 @@ class Base {
   }
 
   private static List<JsonObject> sort(final List<JsonObject> results) {
-    return results.stream().sorted(Base::compare).collect(toList());
+    return results.stream().sorted(Base::compare).toList();
   }
 
   private static String topic(final String name, final String environment) {

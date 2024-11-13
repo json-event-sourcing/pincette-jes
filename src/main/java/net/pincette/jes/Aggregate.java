@@ -36,8 +36,10 @@ import static net.pincette.json.JsonUtil.createArrayBuilder;
 import static net.pincette.json.JsonUtil.createDiff;
 import static net.pincette.json.JsonUtil.createObjectBuilder;
 import static net.pincette.json.JsonUtil.createPatch;
+import static net.pincette.json.JsonUtil.emptyObject;
 import static net.pincette.json.JsonUtil.getBoolean;
 import static net.pincette.json.JsonUtil.isObject;
+import static net.pincette.json.JsonUtil.merge;
 import static net.pincette.json.JsonUtil.string;
 import static net.pincette.mongo.BsonUtil.fromJson;
 import static net.pincette.mongo.Collection.deleteOne;
@@ -48,15 +50,17 @@ import static net.pincette.mongo.JsonClient.update;
 import static net.pincette.mongo.Patch.updateOperators;
 import static net.pincette.rs.Async.mapAsyncSequential;
 import static net.pincette.rs.Box.box;
+import static net.pincette.rs.CatchError.catchError;
+import static net.pincette.rs.Combine.combine;
 import static net.pincette.rs.Filter.filter;
+import static net.pincette.rs.Gate.gate;
 import static net.pincette.rs.Mapper.map;
-import static net.pincette.rs.NeverCancel.neverCancel;
 import static net.pincette.rs.NotFilter.notFilter;
 import static net.pincette.rs.PassThrough.passThrough;
 import static net.pincette.rs.Pipe.pipe;
 import static net.pincette.rs.Util.asValue;
+import static net.pincette.rs.Util.carryOver;
 import static net.pincette.rs.Util.duplicateFilter;
-import static net.pincette.rs.Util.transformAsync;
 import static net.pincette.rs.streams.Message.message;
 import static net.pincette.util.Builder.create;
 import static net.pincette.util.Collections.set;
@@ -64,7 +68,6 @@ import static net.pincette.util.Or.tryWith;
 import static net.pincette.util.Pair.pair;
 import static net.pincette.util.Util.getStackTrace;
 import static net.pincette.util.Util.must;
-import static net.pincette.util.Util.tryToGet;
 import static net.pincette.util.Util.tryToGetForever;
 import static org.reactivestreams.FlowAdapters.toFlowPublisher;
 
@@ -99,10 +102,14 @@ import javax.json.JsonNumber;
 import javax.json.JsonObject;
 import javax.json.JsonObjectBuilder;
 import javax.json.JsonValue;
+import net.pincette.function.SupplierWithException;
 import net.pincette.json.JsonUtil;
 import net.pincette.rs.Fanout;
+import net.pincette.rs.Merge;
+import net.pincette.rs.PassThrough;
 import net.pincette.rs.streams.Message;
 import net.pincette.rs.streams.Streams;
+import net.pincette.util.State;
 import org.bson.Document;
 import org.bson.conversions.Bson;
 
@@ -289,6 +296,10 @@ public class Aggregate<T, U> {
         .map(JsonObjectBuilder::build);
   }
 
+  private static JsonObject command(final Message<String, JsonObject> message) {
+    return message.value.getJsonObject(REDUCER_COMMAND);
+  }
+
   private static String commandDuplicateKey(final JsonObject command) {
     return command.getString(ID) + command.getString(CORR) + command.getString(COMMAND);
   }
@@ -394,6 +405,11 @@ public class Aggregate<T, U> {
     return createObjectBuilder(command).add(ERROR, true).add(EXCEPTION, getStackTrace(e)).build();
   }
 
+  private static Processor<Message<String, JsonObject>, Message<String, JsonObject>> forCommand(
+      final String command) {
+    return filter(m -> command.equals(m.value.getString(COMMAND)));
+  }
+
   private static JsonObject idsToLowerCase(final JsonObject json) {
     return createObjectBuilder(json)
         .add(ID, json.getString(ID).toLowerCase())
@@ -414,6 +430,11 @@ public class Aggregate<T, U> {
         .updateIf(b -> !state.containsKey(TYPE), b -> b.add(TYPE, command.getString(TYPE)))
         .build()
         .build();
+  }
+
+  private static Processor<Message<String, JsonObject>, Message<String, JsonObject>>
+      matchingFilter() {
+    return filter(m -> isMatchingCommand(command(m), state(m)));
   }
 
   /**
@@ -453,16 +474,6 @@ public class Aggregate<T, U> {
     return completedFuture(createObjectBuilder(command).remove(COMMAND).build());
   }
 
-  private static Message<String, JsonObject> reduceProcessorMessage(
-      final JsonObject command, final JsonObject currentState) {
-    return message(
-        command.getString(ID),
-        createObjectBuilder()
-            .add(REDUCER_COMMAND, command)
-            .add(REDUCER_STATE, currentState)
-            .build());
-  }
-
   /**
    * Wraps a generic transformer in a <code>Reducer</code>. The first argument will be the command
    * and the second the current state of the aggregate.
@@ -497,6 +508,10 @@ public class Aggregate<T, U> {
         .reduce(createObjectBuilder(json), JsonObjectBuilder::remove, (b1, b2) -> b1);
   }
 
+  private static JsonObject state(final Message<String, JsonObject> message) {
+    return message.value.getJsonObject(REDUCER_STATE);
+  }
+
   private static JsonObject technicalUpdateOperator(final JsonObject event) {
     return createObjectBuilder()
         .add(
@@ -513,14 +528,6 @@ public class Aggregate<T, U> {
     return pipe(map((Message<String, JsonObject> m) -> pair(m, uniqueFunction.apply(m.value))))
         .then(notFilter(pair -> pair.second.equals(NULL)))
         .then(map(pair -> pair.first.withKey(string(pair.second))));
-  }
-
-  private static JsonObject uniqueError(final JsonObject command) {
-    return createObjectBuilder(command)
-        .add(ERROR, true)
-        .add(STATUS_CODE, 400)
-        .add(MESSAGE, "Missing unique expression fields")
-        .build();
   }
 
   private static CompletionStage<Boolean> updateAggregate(
@@ -556,6 +563,14 @@ public class Aggregate<T, U> {
     return app;
   }
 
+  private Processor<Message<String, JsonObject>, Message<String, JsonObject>> allowedProcessor() {
+    return map(
+        m ->
+            isAllowed(state(m), command(m), breakingTheGlass)
+                ? m
+                : m.withValue(accessError(command(m))));
+  }
+
   /**
    * This builds the <code>Streams</code> topology for the aggregate.
    *
@@ -565,7 +580,7 @@ public class Aggregate<T, U> {
   public Streams<String, JsonObject, T, U> build() {
     must(app != null && builder != null && type != null && database != null && client != null);
     aggregateCollection =
-        ofNullable(database).map(d -> d.getCollection(mongoAggregateCollection())).orElse(null);
+        Optional.of(database).map(d -> d.getCollection(mongoAggregateCollection())).orElse(null);
     session = createSession(client);
 
     final Processor<Message<String, JsonObject>, Message<String, JsonObject>> aggregates =
@@ -591,17 +606,6 @@ public class Aggregate<T, U> {
         .to(topic(EVENT_TOPIC), events);
   }
 
-  private JsonObject checkUnique(final JsonObject command) {
-    return uniqueFunction != null && commandKey(command) == null ? uniqueError(command) : command;
-  }
-
-  private JsonValue commandKey(final JsonObject command) {
-    return ofNullable(uniqueFunction)
-        .map(f -> f.apply(command))
-        .filter(k -> !k.equals(NULL))
-        .orElse(null);
-  }
-
   private Streams<String, JsonObject, T, U> commandSource(
       final Processor<Message<String, JsonObject>, Message<String, JsonObject>> commands) {
     return uniqueFunction != null
@@ -614,6 +618,17 @@ public class Aggregate<T, U> {
 
   private Processor<Message<String, JsonObject>, Message<String, JsonObject>> createCommands() {
     return commandProcessor != null ? box(commands(), commandProcessor) : commands();
+  }
+
+  private Processor<Message<String, JsonObject>, Message<String, JsonObject>>
+      currentStateProcessor() {
+    return mapAsyncSequential(
+        m ->
+            getForever(
+                () ->
+                    getCurrentState(m.value)
+                        .thenApply(
+                            state -> m.withValue(createSource(keepId(m.value, state), state)))));
   }
 
   private CompletionStage<Boolean> deleteMongoAggregate(final JsonObject aggregate) {
@@ -644,41 +659,24 @@ public class Aggregate<T, U> {
     return environment != null ? ("-" + environment) : "";
   }
 
-  private CompletionStage<JsonObject> executeReducer(
-      final JsonObject command, final JsonObject currentState) {
-    return tryToGet(
-            () ->
-                ofNullable(reducer)
-                    .map(red -> red.apply(command, currentState))
-                    .orElseGet(() -> executeSpecificReducer(command, currentState))
-                    .exceptionally(e -> exception(command, e)),
-            e -> completedFuture(exception(command, e)))
-        .orElseGet(() -> completedFuture(null))
-        .thenApply(newState -> processNewState(currentState, newState, command));
-  }
+  private Processor<Message<String, JsonObject>, Message<String, JsonObject>> epilogueProcessor(
+      final Processor<Message<String, JsonObject>, Message<String, JsonObject>> preprocessor,
+      final State<Long> allowed) {
+    return pipe(preprocessor)
+        .then(currentStateProcessor())
+        .then(
+            gate(
+                () -> {
+                  final long n = allowed.get();
 
-  private CompletionStage<JsonObject> executeReducerProcessor(
-      final JsonObject command,
-      final JsonObject currentState,
-      final Processor<Message<String, JsonObject>, Message<String, JsonObject>> processor) {
-    return transformAsync(processor, reduceProcessorMessage(command, currentState))
-        .thenApply(m -> m.value);
-  }
+                  if (n == 1) {
+                    allowed.set(0L);
+                  }
 
-  private CompletionStage<JsonObject> executeSpecificReducer(
-      final JsonObject command, final JsonObject currentState) {
-    final String name = command.getString(COMMAND);
-
-    return preprocessCommand(command)
-        .thenComposeAsync(
-            c ->
-                tryWith(() -> ofNullable(reducers.get(name)).map(red -> red.apply(c, currentState)))
-                    .or(
-                        () ->
-                            ofNullable(reducerProcessors.get(name))
-                                .map(p -> executeReducerProcessor(c, currentState, p)))
-                    .get()
-                    .orElseGet(() -> completedFuture(currentState)));
+                  return n;
+                }))
+        .then(matchingFilter())
+        .then(allowedProcessor());
   }
 
   /**
@@ -693,6 +691,10 @@ public class Aggregate<T, U> {
 
   private CompletionStage<JsonObject> getCurrentState(final JsonObject command) {
     return getMongoCurrentState(command).thenApply(state -> makeManaged(command, state));
+  }
+
+  private <R> CompletionStage<R> getForever(final SupplierWithException<CompletionStage<R>> get) {
+    return tryToGetForever(get, BACK_OFF, this::logException);
   }
 
   private CompletionStage<JsonObject> getMongoCurrentState(final JsonObject command) {
@@ -744,17 +746,6 @@ public class Aggregate<T, U> {
                 .build());
   }
 
-  private CompletionStage<JsonObject> preprocessCommand(final JsonObject command) {
-    return ofNullable(commandProcessors.get(command.getString(COMMAND)))
-        .map(
-            p -> transformAsync(p, message(command.getString(ID), command)).thenApply(m -> m.value))
-        .orElseGet(() -> completedFuture(command));
-  }
-
-  private CompletionStage<JsonObject> processCommand(final JsonObject command) {
-    return reduceCommand(command).thenComposeAsync(this::save);
-  }
-
   private JsonObject processNewState(
       final JsonObject oldState, final JsonObject newState, final JsonObject command) {
     return ofNullable(newState)
@@ -765,42 +756,16 @@ public class Aggregate<T, U> {
         .orElse(newState);
   }
 
-  private CompletionStage<Message<String, JsonObject>> reduce(
-      final Message<String, JsonObject> command) {
-    return tryToGetForever(() -> processCommand(command.value), BACK_OFF, this::logException)
-        .thenApply(command::withValue);
-  }
-
-  private CompletionStage<JsonObject> reduceCommand(final JsonObject command) {
-    final JsonObject checked = checkUnique(command);
-
-    return hasError(checked)
-        ? completedFuture(checked)
-        : getCurrentState(command).thenComposeAsync(state -> reduceIfMatching(command, state));
-  }
-
-  private CompletionStage<JsonObject> reduceIfAllowed(
-      final JsonObject command, final JsonObject currentState) {
-    return isAllowed(currentState, command, breakingTheGlass)
-        ? executeReducer(command, currentState)
-        : completedFuture(accessError(command));
-  }
-
-  private CompletionStage<JsonObject> reduceIfMatching(
-      final JsonObject command, final JsonObject currentState) {
-    return isMatchingCommand(command, currentState)
-        ? reduceIfAllowed(keepId(command, currentState), currentState)
-        : completedFuture(currentState);
+  private Processor<Message<String, JsonObject>, Message<String, JsonObject>> reduceProcessor(
+      final Reducer reducer) {
+    return mapAsyncSequential(m -> reducer.apply(command(m), state(m)).thenApply(m::withValue));
   }
 
   private Processor<Message<String, JsonObject>, Message<String, JsonObject>> reducer() {
     return pipe(map(
             (Message<String, JsonObject> m) ->
                 m.withValue(trace(m.value, j -> true, () -> "Reducing " + string(m.value)))))
-        .then(
-            // AsyncDepend is used here because we don't want the function calls to start in
-            // parallel.
-            mapAsyncSequential(this::reduce))
+        .then(reducer != null ? reducerGeneral() : reducerSpecific())
         .then(
             map(
                 m ->
@@ -814,8 +779,80 @@ public class Aggregate<T, U> {
         .then(filter(m -> m.value != null && !m.value.isEmpty()));
   }
 
+  private Processor<Message<String, JsonObject>, Message<String, JsonObject>> reducerGeneral() {
+    return reducerProcessor(passThrough(), reduceProcessor(reducer));
+  }
+
+  private Processor<Message<String, JsonObject>, Message<String, JsonObject>> reducerProcessor(
+      final Processor<Message<String, JsonObject>, Message<String, JsonObject>> preprocessor,
+      final Processor<Message<String, JsonObject>, Message<String, JsonObject>> reducer) {
+    final var allowed = new State<>(1L);
+    final var epilogue = epilogueProcessor(preprocessor, allowed);
+    final var errors = filter((Message<String, JsonObject> m) -> hasError(m.value));
+    final var red = reducerProcessor(reducer, allowed);
+
+    epilogue.subscribe(Fanout.of(errors, red));
+
+    return combine(epilogue, Merge.of(errors, red));
+  }
+
+  private Processor<Message<String, JsonObject>, Message<String, JsonObject>> reducerProcessor(
+      final Processor<Message<String, JsonObject>, Message<String, JsonObject>> reducer,
+      final State<Long> allowed) {
+    return pipe(filter((Message<String, JsonObject> m) -> !hasError(m.value)))
+        .then(
+            carryOver(
+                box(reducer, catchError(t -> message(null, exception(emptyObject(), t)))),
+                m -> pair(command(m), state(m)),
+                (newState, pair) ->
+                    hasError(newState.value)
+                        ? newState.withValue(merge(pair.first, newState.value))
+                        : newState.withValue(
+                            processNewState(pair.second, newState.value, pair.first))))
+        .then(saveProcessor())
+        .then(
+            map(
+                saved -> {
+                  allowed.set(1L);
+                  return saved;
+                }));
+  }
+
+  private Processor<Message<String, JsonObject>, Message<String, JsonObject>> reducerProcessor(
+      final String command,
+      final Processor<Message<String, JsonObject>, Message<String, JsonObject>> reducer) {
+    return pipe(forCommand(command))
+        .then(
+            reducerProcessor(
+                ofNullable(commandProcessors.get(command)).orElseGet(PassThrough::passThrough),
+                reducer));
+  }
+
+  private Processor<Message<String, JsonObject>, Message<String, JsonObject>> reducerSpecific() {
+    final List<Processor<Message<String, JsonObject>, Message<String, JsonObject>>> processors =
+        concat(
+                reducerProcessors.entrySet().stream()
+                    .map(e -> reducerProcessor(e.getKey(), e.getValue())),
+                reducers.entrySet().stream()
+                    .map(e -> reducerProcessor(e.getKey(), reduceProcessor(e.getValue()))))
+            .toList();
+    final Processor<Message<String, JsonObject>, Message<String, JsonObject>> all = passThrough();
+
+    all.subscribe(Fanout.of(processors));
+
+    return combine(all, Merge.of(processors));
+  }
+
   private CompletionStage<JsonObject> save(final JsonObject newState) {
     return saveReduction(newState, this::handleAggregate);
+  }
+
+  private Processor<Message<String, JsonObject>, Message<String, JsonObject>> saveProcessor() {
+    return mapAsyncSequential(
+        m ->
+            !hasError(m.value)
+                ? getForever(() -> save(m.value).thenApply(m::withValue))
+                : completedFuture(m));
   }
 
   private CompletionStage<JsonObject> saveReduction(
@@ -946,7 +983,7 @@ public class Aggregate<T, U> {
   public Aggregate<T, U> withCommandProcessor(
       final String command,
       final Processor<Message<String, JsonObject>, Message<String, JsonObject>> commandProcessor) {
-    commandProcessors.put(command, box(commandProcessor, neverCancel()));
+    commandProcessors.put(command, commandProcessor);
 
     return this;
   }
@@ -1015,7 +1052,9 @@ public class Aggregate<T, U> {
    * @since 1.0
    */
   public Aggregate<T, U> withReducer(final String command, final Reducer reducer) {
-    reducers.put(command, reducer);
+    if (!reducerProcessors.containsKey(command)) {
+      reducers.put(command, reducer);
+    }
 
     return this;
   }
@@ -1034,6 +1073,7 @@ public class Aggregate<T, U> {
       final String command,
       final Processor<Message<String, JsonObject>, Message<String, JsonObject>> reducer) {
     reducerProcessors.put(command, reducer);
+    reducers.remove(command);
 
     return this;
   }
