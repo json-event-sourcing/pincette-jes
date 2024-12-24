@@ -676,7 +676,16 @@ public class Aggregate<T, U> {
                   return n;
                 }))
         .then(matchingFilter())
-        .then(allowedProcessor());
+        .then(allowedProcessor())
+        .then(
+            map(
+                m -> {
+                  if (hasError(m.value)) {
+                    allowed.set(1L);
+                  }
+
+                  return m;
+                }));
   }
 
   /**

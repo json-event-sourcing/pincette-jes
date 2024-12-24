@@ -1,0 +1,17 @@
+{
+  "_id": "ef7c7fe9-dd26-4bb2-876a-fd10c7c23db0",
+  "_corr": "32d51785-f40d-4da3-ab80-e7cf70dcecc2",
+  "_type": "test-test",
+  "_command": "put",
+  "_jwt": {
+    "sub": "system"
+  },
+  "_seq": 1,
+  "_ops": [
+    {
+      "op": "replace",
+      "path": "/value",
+      "value": 1
+    }
+  ]
+}
