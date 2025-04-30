@@ -50,7 +50,6 @@ import static net.pincette.mongo.JsonClient.update;
 import static net.pincette.mongo.Patch.updateOperators;
 import static net.pincette.rs.Async.mapAsyncSequential;
 import static net.pincette.rs.Box.box;
-import static net.pincette.rs.CatchError.catchError;
 import static net.pincette.rs.Combine.combine;
 import static net.pincette.rs.Filter.filter;
 import static net.pincette.rs.Gate.gate;
@@ -68,6 +67,7 @@ import static net.pincette.util.Or.tryWith;
 import static net.pincette.util.Pair.pair;
 import static net.pincette.util.Util.getStackTrace;
 import static net.pincette.util.Util.must;
+import static net.pincette.util.Util.tryToGet;
 import static net.pincette.util.Util.tryToGetForever;
 import static org.reactivestreams.FlowAdapters.toFlowPublisher;
 
@@ -403,6 +403,10 @@ public class Aggregate<T, U> {
 
   private static JsonObject exception(final JsonObject command, final Throwable e) {
     return createObjectBuilder(command).add(ERROR, true).add(EXCEPTION, getStackTrace(e)).build();
+  }
+
+  private static Message<String, JsonObject> exceptionMessage(final Throwable t) {
+    return message(null, exception(emptyObject(), t));
   }
 
   private static Processor<Message<String, JsonObject>, Message<String, JsonObject>> forCommand(
@@ -767,7 +771,16 @@ public class Aggregate<T, U> {
 
   private Processor<Message<String, JsonObject>, Message<String, JsonObject>> reduceProcessor(
       final Reducer reducer) {
-    return mapAsyncSequential(m -> reducer.apply(command(m), state(m)).thenApply(m::withValue));
+    return mapAsyncSequential(
+        m ->
+            tryToGet(
+                    () ->
+                        reducer
+                            .apply(command(m), state(m))
+                            .thenApply(m::withValue)
+                            .exceptionally(Aggregate::exceptionMessage),
+                    t -> completedFuture(exceptionMessage(t)))
+                .orElse(null));
   }
 
   private Processor<Message<String, JsonObject>, Message<String, JsonObject>> reducer() {
@@ -811,7 +824,7 @@ public class Aggregate<T, U> {
     return pipe(filter((Message<String, JsonObject> m) -> !hasError(m.value)))
         .then(
             carryOver(
-                box(reducer, catchError(t -> message(null, exception(emptyObject(), t)))),
+                reducer,
                 m -> pair(command(m), state(m)),
                 (newState, pair) ->
                     hasError(newState.value)

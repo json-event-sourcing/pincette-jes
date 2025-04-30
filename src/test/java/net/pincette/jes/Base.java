@@ -138,7 +138,7 @@ class Base {
   protected static Resources resources;
 
   @AfterAll
-  public static void afterAll() {
+  static void afterAll() {
     resources.close();
   }
 
@@ -189,7 +189,7 @@ class Base {
   }
 
   @BeforeAll
-  public static void beforeAll() {
+  static void beforeAll() {
     resources = new Resources();
   }
 
@@ -391,14 +391,14 @@ class Base {
   }
 
   @AfterEach
-  public void afterEach() {
+  void afterEach() {
     cleanUpCollections();
     deleteTopics(null);
     deleteTopics("dev");
   }
 
   @BeforeEach
-  public void beforeEach() {
+  void beforeEach() {
     cleanUpCollections();
     deleteTopics(null);
     deleteTopics("dev");
