@@ -49,10 +49,11 @@ import static net.pincette.mongo.JsonClient.findOne;
 import static net.pincette.mongo.JsonClient.update;
 import static net.pincette.mongo.Patch.updateOperators;
 import static net.pincette.rs.Async.mapAsyncSequential;
+import static net.pincette.rs.BackpressureTimout.backpressureTimeout;
 import static net.pincette.rs.Box.box;
+import static net.pincette.rs.Buffer.buffer;
 import static net.pincette.rs.Combine.combine;
 import static net.pincette.rs.Filter.filter;
-import static net.pincette.rs.Gate.gate;
 import static net.pincette.rs.Mapper.map;
 import static net.pincette.rs.NotFilter.notFilter;
 import static net.pincette.rs.PassThrough.passThrough;
@@ -109,7 +110,6 @@ import net.pincette.rs.Merge;
 import net.pincette.rs.PassThrough;
 import net.pincette.rs.streams.Message;
 import net.pincette.rs.streams.Streams;
-import net.pincette.util.State;
 import org.bson.Document;
 import org.bson.conversions.Bson;
 
@@ -244,6 +244,7 @@ public class Aggregate<T, U> {
       reducerProcessors = new HashMap<>();
   private MongoCollection<Document> aggregateCollection;
   private String app;
+  private Duration backpressureTimeout;
   private boolean breakingTheGlass;
   private Streams<String, JsonObject, T, U> builder;
   private MongoClient client;
@@ -587,27 +588,25 @@ public class Aggregate<T, U> {
         Optional.of(database).map(d -> d.getCollection(mongoAggregateCollection())).orElse(null);
     session = createSession(client);
 
-    final Processor<Message<String, JsonObject>, Message<String, JsonObject>> aggregates =
-        aggregates();
     final Processor<Message<String, JsonObject>, Message<String, JsonObject>> errors = errors();
-    final Processor<Message<String, JsonObject>, Message<String, JsonObject>> events = events();
     final Processor<Message<String, JsonObject>, Message<String, JsonObject>> eventsFull =
         eventsFull();
-    final Processor<Message<String, JsonObject>, Message<String, JsonObject>> eventsFullPass =
-        passThrough();
-    final Processor<Message<String, JsonObject>, Message<String, JsonObject>> replies =
-        aggregates();
-
-    eventsFull.subscribe(Fanout.of(aggregates, events, eventsFullPass, replies));
 
     return commandSource(createCommands())
+        .process(
+            backpressureTimeout(
+                backpressureTimeout,
+                () -> "No backpressure signal from the reducer of the app " + fullType()))
         .process(reducer())
         .subscribe(Fanout.of(eventsFull, errors))
-        .to(topic(EVENT_FULL_TOPIC), eventsFullPass)
+        .to(topic(EVENT_FULL_TOPIC), eventsFull)
         .to(topic(REPLY_TOPIC), errors)
-        .to(topic(REPLY_TOPIC), replies)
-        .to(topic(AGGREGATE_TOPIC), aggregates)
-        .to(topic(EVENT_TOPIC), events);
+        .from(topic(EVENT_FULL_TOPIC), aggregates())
+        .to(topic(REPLY_TOPIC))
+        .from(topic(EVENT_FULL_TOPIC), aggregates())
+        .to(topic(AGGREGATE_TOPIC))
+        .from(topic(EVENT_FULL_TOPIC), events())
+        .to(topic(EVENT_TOPIC));
   }
 
   private Streams<String, JsonObject, T, U> commandSource(
@@ -664,32 +663,11 @@ public class Aggregate<T, U> {
   }
 
   private Processor<Message<String, JsonObject>, Message<String, JsonObject>> epilogueProcessor(
-      final Processor<Message<String, JsonObject>, Message<String, JsonObject>> preprocessor,
-      final State<Long> allowed) {
+      final Processor<Message<String, JsonObject>, Message<String, JsonObject>> preprocessor) {
     return pipe(preprocessor)
         .then(currentStateProcessor())
-        .then(
-            gate(
-                () -> {
-                  final long n = allowed.get();
-
-                  if (n == 1) {
-                    allowed.set(0L);
-                  }
-
-                  return n;
-                }))
         .then(matchingFilter())
-        .then(allowedProcessor())
-        .then(
-            map(
-                m -> {
-                  if (hasError(m.value)) {
-                    allowed.set(1L);
-                  }
-
-                  return m;
-                }));
+        .then(allowedProcessor());
   }
 
   /**
@@ -808,10 +786,9 @@ public class Aggregate<T, U> {
   private Processor<Message<String, JsonObject>, Message<String, JsonObject>> reducerProcessor(
       final Processor<Message<String, JsonObject>, Message<String, JsonObject>> preprocessor,
       final Processor<Message<String, JsonObject>, Message<String, JsonObject>> reducer) {
-    final var allowed = new State<>(1L);
-    final var epilogue = epilogueProcessor(preprocessor, allowed);
+    final var epilogue = epilogueProcessor(preprocessor);
     final var errors = filter((Message<String, JsonObject> m) -> hasError(m.value));
-    final var red = reducerProcessor(reducer, allowed);
+    final var red = reducerProcessor(reducer);
 
     epilogue.subscribe(Fanout.of(errors, red));
 
@@ -819,8 +796,7 @@ public class Aggregate<T, U> {
   }
 
   private Processor<Message<String, JsonObject>, Message<String, JsonObject>> reducerProcessor(
-      final Processor<Message<String, JsonObject>, Message<String, JsonObject>> reducer,
-      final State<Long> allowed) {
+      final Processor<Message<String, JsonObject>, Message<String, JsonObject>> reducer) {
     return pipe(filter((Message<String, JsonObject> m) -> !hasError(m.value)))
         .then(
             carryOver(
@@ -832,12 +808,7 @@ public class Aggregate<T, U> {
                         : newState.withValue(
                             processNewState(pair.second, newState.value, pair.first))))
         .then(saveProcessor())
-        .then(
-            map(
-                saved -> {
-                  allowed.set(1L);
-                  return saved;
-                }));
+        .then(buffer(1)); // Ensure serialisation.
   }
 
   private Processor<Message<String, JsonObject>, Message<String, JsonObject>> reducerProcessor(
@@ -949,6 +920,12 @@ public class Aggregate<T, U> {
    */
   public Aggregate<T, U> withApp(final String app) {
     this.app = app;
+
+    return this;
+  }
+
+  public Aggregate<T, U> withBackpressureTimeout(final Duration backpressureTimeout) {
+    this.backpressureTimeout = backpressureTimeout;
 
     return this;
   }

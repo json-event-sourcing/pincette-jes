@@ -52,4 +52,10 @@ class TestAggregate extends Base {
     runTest("put_good_user");
     runTest("put_good_user", "dev", true);
   }
+
+  @Test
+  @DisplayName("performance")
+  void performance() {
+    runPerformanceTest(10000);
+  }
 }

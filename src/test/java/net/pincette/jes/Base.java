@@ -1,6 +1,7 @@
 package net.pincette.jes;
 
 import static java.lang.Integer.MAX_VALUE;
+import static java.time.Duration.ofSeconds;
 import static java.util.Optional.ofNullable;
 import static java.util.UUID.randomUUID;
 import static java.util.concurrent.CompletableFuture.completedFuture;
@@ -15,7 +16,9 @@ import static net.pincette.jes.JsonFields.AFTER;
 import static net.pincette.jes.JsonFields.BEFORE;
 import static net.pincette.jes.JsonFields.CORR;
 import static net.pincette.jes.JsonFields.ID;
+import static net.pincette.jes.JsonFields.JWT;
 import static net.pincette.jes.JsonFields.SEQ;
+import static net.pincette.jes.JsonFields.SUB;
 import static net.pincette.jes.JsonFields.TIMESTAMP;
 import static net.pincette.json.Factory.a;
 import static net.pincette.json.Factory.f;
@@ -39,6 +42,7 @@ import static net.pincette.util.Collections.merge;
 import static net.pincette.util.Collections.set;
 import static net.pincette.util.Or.tryWith;
 import static net.pincette.util.Pair.pair;
+import static net.pincette.util.StreamUtil.rangeExclusive;
 import static net.pincette.util.Util.tryToDoRethrow;
 import static net.pincette.util.Util.tryToDoWithRethrow;
 import static net.pincette.util.Util.tryToGetRethrow;
@@ -65,6 +69,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.UUID;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.Flow.Processor;
 import java.util.concurrent.Flow.Publisher;
@@ -77,10 +82,12 @@ import javax.json.JsonObject;
 import javax.json.JsonReader;
 import net.pincette.kafka.json.JsonDeserializer;
 import net.pincette.kafka.json.JsonSerializer;
+import net.pincette.rs.Serializer;
 import net.pincette.rs.Source;
 import net.pincette.rs.kafka.ConsumerEvent;
 import net.pincette.rs.streams.Message;
 import net.pincette.rs.streams.Streams;
+import net.pincette.util.Pair;
 import org.apache.kafka.clients.admin.Admin;
 import org.apache.kafka.clients.admin.NewTopic;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
@@ -104,6 +111,7 @@ class Base {
   static final String MINUS = "minus";
   static final String PLUS = "plus";
   static final String REPLY = "reply";
+  private static final JsonObject SYSTEM = o(f(SUB, v("system")));
   static final String TYPE = "test";
   static final String UNIQUE = "unique";
   static final String VALUE = "value";
@@ -166,6 +174,7 @@ class Base {
             .withBuilder(streams)
             .withLogger(getLogger("net.pincette.jes.test"))
             .withUniqueExpression(createValue("$" + UNIQUE))
+            .withBackpressureTimeout(ofSeconds(5))
             .withReducer(PATCH, Aggregate::patch)
             .withReducer(
                 PUT,
@@ -191,6 +200,7 @@ class Base {
   @BeforeAll
   static void beforeAll() {
     resources = new Resources();
+    Serializer.startPool(5);
   }
 
   private static void cleanUpCollections() {
@@ -231,6 +241,43 @@ class Base {
 
   private static KafkaConsumer<String, JsonObject> consumer() {
     return new KafkaConsumer<>(CONSUMER_CONFIG);
+  }
+
+  private static Pair<List<JsonObject>, List<JsonObject>> createTestMessages(
+      final int numberOfMessages) {
+    final List<JsonObject> aggregates = new ArrayList<>();
+    final List<JsonObject> commands = new ArrayList<>();
+    final String id = UUID.randomUUID().toString();
+    final Supplier<JsonObject> common =
+        () ->
+            createObjectBuilder()
+                .add(ID, id)
+                .add(CORR, UUID.randomUUID().toString())
+                .add(JsonFields.TYPE, fullType())
+                .add(JWT, SYSTEM)
+                .add(UNIQUE, 0)
+                .build();
+    final JsonObject commonPut = common.get();
+
+    commands.add(createObjectBuilder(commonPut).add(JsonFields.COMMAND, PUT).add(VALUE, 0).build());
+    aggregates.add(
+        createObjectBuilder(commonPut).add(SEQ, 0).add(VALUE, 0).add(JsonFields.ACL, ACL).build());
+
+    rangeExclusive(1, numberOfMessages)
+        .forEach(
+            i -> {
+              final JsonObject c = common.get();
+
+              commands.add(createObjectBuilder(c).add(JsonFields.COMMAND, PLUS).build());
+              aggregates.add(
+                  createObjectBuilder(c)
+                      .add(SEQ, i)
+                      .add(VALUE, i)
+                      .add(JsonFields.ACL, ACL)
+                      .build());
+            });
+
+    return pair(commands, aggregates);
   }
 
   private static void createTopics(final String environment) {
@@ -406,17 +453,30 @@ class Base {
     createTopics("dev");
   }
 
-  protected void runTest(final String name) {
-    runTest(name, null, false);
-  }
-
-  protected void runTest(final String name, final String environment, final boolean withProcessor) {
+  protected void runPerformanceTest(final int numberOfMessages) {
+    final Pair<List<JsonObject>, List<JsonObject>> messages = createTestMessages(numberOfMessages);
+    final List<JsonObject> resultAggregates = new ArrayList<>();
+    final AtomicInteger running = new AtomicInteger(1);
     final Streams<
             String,
             JsonObject,
             ConsumerRecord<String, JsonObject>,
             ProducerRecord<String, JsonObject>>
         streams = createStreams();
+
+    aggregate(streams, null, true)
+        .to(topic(COMMAND, null), Source.of(inputMessages(messages.first)))
+        .consume(
+            topic(AGGREGATE, null), values(messages.second, resultAggregates, streams, running))
+        .start();
+    assertEquals(messages.second, resultAggregates);
+  }
+
+  protected void runTest(final String name) {
+    runTest(name, null, false);
+  }
+
+  protected void runTest(final String name, final String environment, final boolean withProcessor) {
     final List<JsonObject> expectedAggregates = loadMessages(resource(name, AGGREGATE));
     final List<JsonObject> expectedEvents = loadMessages(resource(name, EVENT));
     final List<JsonObject> expectedEventsFull = loadMessages(resource(name, EVENT_FULL));
@@ -426,6 +486,12 @@ class Base {
     final List<JsonObject> resultEventsFull = new ArrayList<>();
     final List<JsonObject> resultReplies = new ArrayList<>();
     final AtomicInteger running = new AtomicInteger(4);
+    final Streams<
+            String,
+            JsonObject,
+            ConsumerRecord<String, JsonObject>,
+            ProducerRecord<String, JsonObject>>
+        streams = createStreams();
 
     aggregate(streams, environment, withProcessor)
         .to(
