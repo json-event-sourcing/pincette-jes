@@ -75,6 +75,7 @@ import java.util.concurrent.Flow.Processor;
 import java.util.concurrent.Flow.Publisher;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Consumer;
+import java.util.function.IntSupplier;
 import java.util.function.IntUnaryOperator;
 import java.util.function.Supplier;
 import java.util.stream.Stream;
@@ -230,9 +231,9 @@ class Base {
   }
 
   private static <T> int compareAbsent(final T v1, final T v2) {
-    final Supplier<Integer> tryOther = () -> v1 != null && v2 == null ? -1 : 0;
+    final IntSupplier tryOther = () -> v1 != null && v2 == null ? -1 : 0;
 
-    return v1 == null && v2 != null ? 1 : tryOther.get();
+    return v1 == null && v2 != null ? 1 : tryOther.getAsInt();
   }
 
   private static Optional<Integer> compareResult(final int result) {
