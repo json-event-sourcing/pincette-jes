@@ -61,6 +61,7 @@ import static net.pincette.rs.Pipe.pipe;
 import static net.pincette.rs.Util.asValue;
 import static net.pincette.rs.Util.carryOver;
 import static net.pincette.rs.Util.duplicateFilter;
+import static net.pincette.rs.Util.sharded;
 import static net.pincette.rs.streams.Message.message;
 import static net.pincette.util.Builder.create;
 import static net.pincette.util.Collections.set;
@@ -237,10 +238,12 @@ public class Aggregate<T, U> {
       set(COMMAND, CORR, ID, JWT, LANGUAGES, SEQ, TEST, TIMESTAMP, TYPE);
   private static final String UNIQUE_TOPIC = "unique";
 
-  private final Map<String, Processor<Message<String, JsonObject>, Message<String, JsonObject>>>
+  private final Map<
+          String, Supplier<Processor<Message<String, JsonObject>, Message<String, JsonObject>>>>
       commandProcessors = new HashMap<>();
   private final Map<String, Reducer> reducers = new HashMap<>();
-  private final Map<String, Processor<Message<String, JsonObject>, Message<String, JsonObject>>>
+  private final Map<
+          String, Supplier<Processor<Message<String, JsonObject>, Message<String, JsonObject>>>>
       reducerProcessors = new HashMap<>();
   private MongoCollection<Document> aggregateCollection;
   private String app;
@@ -253,7 +256,7 @@ public class Aggregate<T, U> {
   private String environment;
   private Logger logger;
   private Reducer reducer;
-  private ClientSession session;
+  private int shards = 1;
   private String type;
   private JsonValue uniqueExpression;
   private Function<JsonObject, JsonValue> uniqueFunction;
@@ -586,7 +589,6 @@ public class Aggregate<T, U> {
     must(app != null && builder != null && type != null && database != null && client != null);
     aggregateCollection =
         Optional.of(database).map(d -> d.getCollection(mongoAggregateCollection())).orElse(null);
-    session = createSession(client);
 
     final Processor<Message<String, JsonObject>, Message<String, JsonObject>> errors = errors();
     final Processor<Message<String, JsonObject>, Message<String, JsonObject>> eventsFull =
@@ -597,7 +599,13 @@ public class Aggregate<T, U> {
             backpressureTimeout(
                 backpressureTimeout,
                 () -> "No backpressure signal from the reducer of the app " + fullType()))
-        .process(reducer())
+        .process(
+            shards > 1
+                ? sharded(
+                    () -> box(buffer(100), reducer(createSession(client))),
+                    shards,
+                    m -> m.key.hashCode())
+                : reducer(createSession(client)))
         .subscribe(Fanout.of(eventsFull, errors))
         .to(topic(EVENT_FULL_TOPIC), eventsFull)
         .to(topic(REPLY_TOPIC), errors)
@@ -623,18 +631,19 @@ public class Aggregate<T, U> {
     return commandProcessor != null ? box(commands(), commandProcessor) : commands();
   }
 
-  private Processor<Message<String, JsonObject>, Message<String, JsonObject>>
-      currentStateProcessor() {
+  private Processor<Message<String, JsonObject>, Message<String, JsonObject>> currentStateProcessor(
+      final ClientSession session) {
     return mapAsyncSequential(
         m ->
             getForever(
                 () ->
-                    getCurrentState(m.value)
+                    getCurrentState(m.value, session)
                         .thenApply(
                             state -> m.withValue(createSource(keepId(m.value, state), state)))));
   }
 
-  private CompletionStage<Boolean> deleteMongoAggregate(final JsonObject aggregate) {
+  private CompletionStage<Boolean> deleteMongoAggregate(
+      final JsonObject aggregate, final ClientSession session) {
     trace(aggregate, a -> true, () -> "Deleting aggregate " + string(aggregate));
 
     return deleteOne(aggregateCollection, session, eq(ID, aggregate.getString(ID)))
@@ -642,10 +651,11 @@ public class Aggregate<T, U> {
         .thenApply(result -> must(result, r -> r));
   }
 
-  private Optional<CompletionStage<Boolean>> deleteReduction(final JsonObject reduction) {
+  private Optional<CompletionStage<Boolean>> deleteReduction(
+      final JsonObject reduction, final ClientSession session) {
     return getBoolean(reduction, "/" + AFTER + "/" + DELETED)
         .filter(deleted -> deleted)
-        .map(deleted -> deleteMongoAggregate(reduction.getJsonObject(AFTER)));
+        .map(deleted -> deleteMongoAggregate(reduction.getJsonObject(AFTER), session));
   }
 
   /**
@@ -663,9 +673,11 @@ public class Aggregate<T, U> {
   }
 
   private Processor<Message<String, JsonObject>, Message<String, JsonObject>> epilogueProcessor(
-      final Processor<Message<String, JsonObject>, Message<String, JsonObject>> preprocessor) {
+      final Processor<Message<String, JsonObject>, Message<String, JsonObject>> preprocessor,
+      final ClientSession session) {
     return pipe(preprocessor)
-        .then(currentStateProcessor())
+        .then(buffer(1)) // Ensure serialisation.
+        .then(currentStateProcessor(session))
         .then(matchingFilter())
         .then(allowedProcessor());
   }
@@ -680,23 +692,26 @@ public class Aggregate<T, U> {
     return app + "-" + type;
   }
 
-  private CompletionStage<JsonObject> getCurrentState(final JsonObject command) {
-    return getMongoCurrentState(command).thenApply(state -> makeManaged(command, state));
+  private CompletionStage<JsonObject> getCurrentState(
+      final JsonObject command, final ClientSession session) {
+    return getMongoCurrentState(command, session).thenApply(state -> makeManaged(command, state));
   }
 
   private <R> CompletionStage<R> getForever(final SupplierWithException<CompletionStage<R>> get) {
     return tryToGetForever(get, BACK_OFF, this::logException);
   }
 
-  private CompletionStage<JsonObject> getMongoCurrentState(final JsonObject command) {
+  private CompletionStage<JsonObject> getMongoCurrentState(
+      final JsonObject command, final ClientSession session) {
     return findOne(aggregateCollection, session, mongoStateCriterion(command))
         .thenApply(currentState -> currentState.orElseGet(JsonUtil::emptyObject));
   }
 
-  private CompletionStage<JsonObject> handleAggregate(final JsonObject reduction) {
-    return tryWith(() -> deleteReduction(reduction).orElse(null))
-        .or(() -> updateReductionNew(reduction).orElse(null))
-        .or(() -> updateReductionExisting(reduction).orElse(null))
+  private CompletionStage<JsonObject> handleAggregate(
+      final JsonObject reduction, final ClientSession session) {
+    return tryWith(() -> deleteReduction(reduction, session).orElse(null))
+        .or(() -> updateReductionNew(reduction, session).orElse(null))
+        .or(() -> updateReductionExisting(reduction, session).orElse(null))
         .get()
         .map(result -> result.thenApply(res -> must(res, r -> r)).thenApply(res -> reduction))
         .orElseGet(() -> completedFuture(reduction));
@@ -761,11 +776,12 @@ public class Aggregate<T, U> {
                 .orElse(null));
   }
 
-  private Processor<Message<String, JsonObject>, Message<String, JsonObject>> reducer() {
+  private Processor<Message<String, JsonObject>, Message<String, JsonObject>> reducer(
+      final ClientSession session) {
     return pipe(map(
             (Message<String, JsonObject> m) ->
                 m.withValue(trace(m.value, j -> true, () -> "Reducing " + string(m.value)))))
-        .then(reducer != null ? reducerGeneral() : reducerSpecific())
+        .then(reducer != null ? reducerGeneral(session) : reducerSpecific(session))
         .then(
             map(
                 m ->
@@ -779,16 +795,18 @@ public class Aggregate<T, U> {
         .then(filter(m -> m.value != null && !m.value.isEmpty()));
   }
 
-  private Processor<Message<String, JsonObject>, Message<String, JsonObject>> reducerGeneral() {
-    return reducerProcessor(passThrough(), reduceProcessor(reducer));
+  private Processor<Message<String, JsonObject>, Message<String, JsonObject>> reducerGeneral(
+      final ClientSession session) {
+    return reducerProcessor(passThrough(), reduceProcessor(reducer), session);
   }
 
   private Processor<Message<String, JsonObject>, Message<String, JsonObject>> reducerProcessor(
       final Processor<Message<String, JsonObject>, Message<String, JsonObject>> preprocessor,
-      final Processor<Message<String, JsonObject>, Message<String, JsonObject>> reducer) {
-    final var epilogue = epilogueProcessor(preprocessor);
+      final Processor<Message<String, JsonObject>, Message<String, JsonObject>> reducer,
+      final ClientSession session) {
+    final var epilogue = epilogueProcessor(preprocessor, session);
     final var errors = filter((Message<String, JsonObject> m) -> hasError(m.value));
-    final var red = reducerProcessor(reducer);
+    final var red = reducerProcessor(reducer, session);
 
     epilogue.subscribe(Fanout.of(errors, red));
 
@@ -796,7 +814,8 @@ public class Aggregate<T, U> {
   }
 
   private Processor<Message<String, JsonObject>, Message<String, JsonObject>> reducerProcessor(
-      final Processor<Message<String, JsonObject>, Message<String, JsonObject>> reducer) {
+      final Processor<Message<String, JsonObject>, Message<String, JsonObject>> reducer,
+      final ClientSession session) {
     return pipe(filter((Message<String, JsonObject> m) -> !hasError(m.value)))
         .then(
             carryOver(
@@ -807,27 +826,35 @@ public class Aggregate<T, U> {
                         ? newState.withValue(merge(pair.first, newState.value))
                         : newState.withValue(
                             processNewState(pair.second, newState.value, pair.first))))
-        .then(saveProcessor())
+        .then(saveProcessor(session))
         .then(buffer(1)); // Ensure serialisation.
   }
 
   private Processor<Message<String, JsonObject>, Message<String, JsonObject>> reducerProcessor(
       final String command,
-      final Processor<Message<String, JsonObject>, Message<String, JsonObject>> reducer) {
+      final Supplier<Processor<Message<String, JsonObject>, Message<String, JsonObject>>> reducer,
+      final ClientSession session) {
     return pipe(forCommand(command))
         .then(
             reducerProcessor(
-                ofNullable(commandProcessors.get(command)).orElseGet(PassThrough::passThrough),
-                reducer));
+                ofNullable(commandProcessors.get(command))
+                    .map(Supplier::get)
+                    .orElseGet(PassThrough::passThrough),
+                reducer.get(),
+                session));
   }
 
-  private Processor<Message<String, JsonObject>, Message<String, JsonObject>> reducerSpecific() {
+  private Processor<Message<String, JsonObject>, Message<String, JsonObject>> reducerSpecific(
+      final ClientSession session) {
     final List<Processor<Message<String, JsonObject>, Message<String, JsonObject>>> processors =
         concat(
                 reducerProcessors.entrySet().stream()
-                    .map(e -> reducerProcessor(e.getKey(), e.getValue())),
+                    .map(e -> reducerProcessor(e.getKey(), e.getValue(), session)),
                 reducers.entrySet().stream()
-                    .map(e -> reducerProcessor(e.getKey(), reduceProcessor(e.getValue()))))
+                    .map(
+                        e ->
+                            reducerProcessor(
+                                e.getKey(), () -> reduceProcessor(e.getValue()), session)))
             .toList();
     final Processor<Message<String, JsonObject>, Message<String, JsonObject>> all = passThrough();
 
@@ -836,15 +863,16 @@ public class Aggregate<T, U> {
     return combine(all, Merge.of(processors));
   }
 
-  private CompletionStage<JsonObject> save(final JsonObject newState) {
-    return saveReduction(newState, this::handleAggregate);
+  private CompletionStage<JsonObject> save(final JsonObject newState, final ClientSession session) {
+    return saveReduction(newState, json -> handleAggregate(json, session));
   }
 
-  private Processor<Message<String, JsonObject>, Message<String, JsonObject>> saveProcessor() {
+  private Processor<Message<String, JsonObject>, Message<String, JsonObject>> saveProcessor(
+      final ClientSession session) {
     return mapAsyncSequential(
         m ->
             !hasError(m.value)
-                ? getForever(() -> save(m.value).thenApply(m::withValue))
+                ? getForever(() -> save(m.value, session).thenApply(m::withValue))
                 : completedFuture(m));
   }
 
@@ -883,20 +911,23 @@ public class Aggregate<T, U> {
     return type;
   }
 
-  private CompletionStage<Boolean> updateMongoAggregate(final JsonObject aggregate) {
+  private CompletionStage<Boolean> updateMongoAggregate(
+      final JsonObject aggregate, final ClientSession session) {
     trace(aggregate, a -> true, () -> "Replacing aggregate " + string(aggregate));
 
     return update(aggregateCollection, aggregate, session)
         .thenApply(result -> must(result, r -> r));
   }
 
-  private Optional<CompletionStage<Boolean>> updateReductionNew(final JsonObject reduction) {
+  private Optional<CompletionStage<Boolean>> updateReductionNew(
+      final JsonObject reduction, final ClientSession session) {
     return beforeWithoutTechnical(reduction)
         .filter(JsonObject::isEmpty)
-        .map(before -> updateMongoAggregate(reduction.getJsonObject(AFTER)));
+        .map(before -> updateMongoAggregate(reduction.getJsonObject(AFTER), session));
   }
 
-  private Optional<CompletionStage<Boolean>> updateReductionExisting(final JsonObject reduction) {
+  private Optional<CompletionStage<Boolean>> updateReductionExisting(
+      final JsonObject reduction, final ClientSession session) {
     return beforeWithoutTechnical(reduction)
         .filter(before -> !before.isEmpty())
         .map(
@@ -981,7 +1012,8 @@ public class Aggregate<T, U> {
    */
   public Aggregate<T, U> withCommandProcessor(
       final String command,
-      final Processor<Message<String, JsonObject>, Message<String, JsonObject>> commandProcessor) {
+      final Supplier<Processor<Message<String, JsonObject>, Message<String, JsonObject>>>
+          commandProcessor) {
     commandProcessors.put(command, commandProcessor);
 
     return this;
@@ -1070,7 +1102,7 @@ public class Aggregate<T, U> {
    */
   public Aggregate<T, U> withReducer(
       final String command,
-      final Processor<Message<String, JsonObject>, Message<String, JsonObject>> reducer) {
+      final Supplier<Processor<Message<String, JsonObject>, Message<String, JsonObject>>> reducer) {
     reducerProcessors.put(command, reducer);
     reducers.remove(command);
 
@@ -1087,6 +1119,19 @@ public class Aggregate<T, U> {
    */
   public Aggregate<T, U> withReducer(final Reducer reducer) {
     this.reducer = reducer;
+
+    return this;
+  }
+
+  /**
+   * Sets the number of shards, which increases parallelism through consistent hashing.
+   *
+   * @param shards the number of shards.
+   * @return The aggregate object itself.
+   * @since 4.0.0
+   */
+  public Aggregate<T, U> withShards(final int shards) {
+    this.shards = shards;
 
     return this;
   }

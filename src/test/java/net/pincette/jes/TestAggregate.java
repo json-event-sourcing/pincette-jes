@@ -58,4 +58,28 @@ class TestAggregate extends Base {
   void performance() {
     runPerformanceTest(10000);
   }
+
+  @Test
+  @DisplayName("sharded 1")
+  void sharded1() {
+    runShardedTest(2, 2);
+  }
+
+  @Test
+  @DisplayName("sharded 2")
+  void sharded2() {
+    runShardedTest(10000, 1);
+  }
+
+  @Test
+  @DisplayName("sharded 3")
+  void sharded3() {
+    runShardedTest(10000, 2);
+  }
+
+  @Test
+  @DisplayName("sharded 4")
+  void sharded4() {
+    runShardedTest(10000, 10);
+  }
 }

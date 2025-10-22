@@ -2,6 +2,7 @@ package net.pincette.jes;
 
 import static java.lang.Integer.MAX_VALUE;
 import static java.time.Duration.ofSeconds;
+import static java.util.Comparator.comparing;
 import static java.util.Optional.ofNullable;
 import static java.util.UUID.randomUUID;
 import static java.util.concurrent.CompletableFuture.completedFuture;
@@ -43,6 +44,8 @@ import static net.pincette.util.Collections.set;
 import static net.pincette.util.Or.tryWith;
 import static net.pincette.util.Pair.pair;
 import static net.pincette.util.StreamUtil.rangeExclusive;
+import static net.pincette.util.StreamUtil.zip;
+import static net.pincette.util.Util.initLogging;
 import static net.pincette.util.Util.tryToDoRethrow;
 import static net.pincette.util.Util.tryToDoWithRethrow;
 import static net.pincette.util.Util.tryToGetRethrow;
@@ -65,6 +68,7 @@ import java.net.URI;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -74,7 +78,9 @@ import java.util.concurrent.CompletionStage;
 import java.util.concurrent.Flow.Processor;
 import java.util.concurrent.Flow.Publisher;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.BiConsumer;
 import java.util.function.Consumer;
+import java.util.function.Function;
 import java.util.function.IntSupplier;
 import java.util.function.IntUnaryOperator;
 import java.util.function.Supplier;
@@ -99,6 +105,7 @@ import org.apache.kafka.common.serialization.StringDeserializer;
 import org.apache.kafka.common.serialization.StringSerializer;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
 
@@ -165,7 +172,26 @@ class Base {
               streams,
           final String environment,
           final boolean withProcessor) {
-    final var aggregate =
+    return aggregate(streams, environment, withProcessor, true, 1);
+  }
+
+  private static Streams<
+          String,
+          JsonObject,
+          ConsumerRecord<String, JsonObject>,
+          ProducerRecord<String, JsonObject>>
+      aggregate(
+          final Streams<
+                  String,
+                  JsonObject,
+                  ConsumerRecord<String, JsonObject>,
+                  ProducerRecord<String, JsonObject>>
+              streams,
+          final String environment,
+          final boolean withProcessor,
+          final boolean withUnique,
+          final int shards) {
+    var aggregate =
         new Aggregate<ConsumerRecord<String, JsonObject>, ProducerRecord<String, JsonObject>>()
             .withApp(APP)
             .withType(TYPE)
@@ -174,8 +200,8 @@ class Base {
             .withEnvironment(environment)
             .withBuilder(streams)
             .withLogger(getLogger("net.pincette.jes.test"))
-            .withUniqueExpression(createValue("$" + UNIQUE))
             .withBackpressureTimeout(ofSeconds(5))
+            .withShards(shards)
             .withReducer(PATCH, Aggregate::patch)
             .withReducer(
                 PUT,
@@ -186,12 +212,16 @@ class Base {
                             .add(JsonFields.ACL, ACL)
                             .build()));
 
+    if (withUnique) {
+      aggregate = aggregate.withUniqueExpression(createValue("$" + UNIQUE));
+    }
+
     return (withProcessor
             ? aggregate
-                .withReducer(PLUS, reduceProcessor(v -> v + 1))
-                .withReducer(MINUS, reduceProcessor(v -> v - 1))
-                .withCommandProcessor(PLUS, map(c -> c))
-                .withCommandProcessor(PATCH, map(c -> c))
+                .withReducer(PLUS, () -> reduceProcessor(v -> v + 1))
+                .withReducer(MINUS, () -> reduceProcessor(v -> v - 1))
+                .withCommandProcessor(PLUS, () -> map(c -> c))
+                .withCommandProcessor(PATCH, () -> map(c -> c))
             : aggregate
                 .withReducer(PLUS, (command, currentState) -> reduce(currentState, v -> v + 1))
                 .withReducer(MINUS, (command, currentState) -> reduce(currentState, v -> v - 1)))
@@ -200,6 +230,7 @@ class Base {
 
   @BeforeAll
   static void beforeAll() {
+    initLogging();
     resources = new Resources();
     Serializer.startPool(5);
   }
@@ -244,7 +275,7 @@ class Base {
     return new KafkaConsumer<>(CONSUMER_CONFIG);
   }
 
-  private static Pair<List<JsonObject>, List<JsonObject>> createTestMessages(
+  private static Pair<List<JsonObject>, List<JsonObject>> createTestMessagesPlus(
       final int numberOfMessages) {
     final List<JsonObject> aggregates = new ArrayList<>();
     final List<JsonObject> commands = new ArrayList<>();
@@ -281,6 +312,37 @@ class Base {
     return pair(commands, aggregates);
   }
 
+  private static Pair<List<JsonObject>, List<JsonObject>> createTestMessagesPut(
+      final int numberOfMessages) {
+    final List<JsonObject> aggregates = new ArrayList<>();
+    final List<JsonObject> commands = new ArrayList<>();
+    final Supplier<JsonObject> common =
+        () ->
+            createObjectBuilder()
+                .add(ID, UUID.randomUUID().toString())
+                .add(CORR, UUID.randomUUID().toString())
+                .add(JsonFields.TYPE, fullType())
+                .add(JWT, SYSTEM)
+                .build();
+
+    rangeExclusive(0, numberOfMessages)
+        .forEach(
+            i -> {
+              final JsonObject c = common.get();
+
+              commands.add(
+                  createObjectBuilder(c).add(JsonFields.COMMAND, PUT).add(VALUE, i).build());
+              aggregates.add(
+                  createObjectBuilder(c)
+                      .add(SEQ, 0)
+                      .add(VALUE, i)
+                      .add(JsonFields.ACL, ACL)
+                      .build());
+            });
+
+    return pair(commands, aggregates);
+  }
+
   private static void createTopics(final String environment) {
     tryToDoWithRethrow(
         () -> Admin.create(COMMON_CONFIG),
@@ -301,6 +363,7 @@ class Base {
     return Streams.streams(
         fromPublisher(
             publisher(Base::consumer)
+                .withMaximumMessageLag(-1)
                 .withEventHandler(
                     (event, consumer) -> {
                       if (event == ConsumerEvent.STARTED) {
@@ -417,7 +480,7 @@ class Base {
   }
 
   private static Consumer<Publisher<Message<String, JsonObject>>> values(
-      final List<JsonObject> expected,
+      final int numberOfMessages,
       final List<JsonObject> results,
       final Streams<
               String,
@@ -432,7 +495,8 @@ class Base {
                 message -> {
                   results.add(removeTimestamps(message).value);
 
-                  if (results.size() == expected.size() && running.decrementAndGet() == 0) {
+                  if (results.size() == numberOfMessages
+                      && (running == null || running.decrementAndGet() == 0)) {
                     streams.stop();
                   }
                 }));
@@ -455,9 +519,19 @@ class Base {
   }
 
   protected void runPerformanceTest(final int numberOfMessages) {
-    final Pair<List<JsonObject>, List<JsonObject>> messages = createTestMessages(numberOfMessages);
+    runPerformanceTest(
+        numberOfMessages, 1, true, Base::createTestMessagesPlus, Assertions::assertEquals);
+  }
+
+  protected void runPerformanceTest(
+      final int numberOfMessages,
+      final int numberOfShards,
+      final boolean withUnique,
+      final Function<Integer, Pair<List<JsonObject>, List<JsonObject>>> createTestMessages,
+      final BiConsumer<List<JsonObject>, List<JsonObject>> assertFunction) {
+    final Pair<List<JsonObject>, List<JsonObject>> messages =
+        createTestMessages.apply(numberOfMessages);
     final List<JsonObject> resultAggregates = new ArrayList<>();
-    final AtomicInteger running = new AtomicInteger(1);
     final Streams<
             String,
             JsonObject,
@@ -465,12 +539,27 @@ class Base {
             ProducerRecord<String, JsonObject>>
         streams = createStreams();
 
-    aggregate(streams, null, true)
+    aggregate(streams, null, true, withUnique, numberOfShards)
         .to(topic(COMMAND, null), Source.of(inputMessages(messages.first)))
         .consume(
-            topic(AGGREGATE, null), values(messages.second, resultAggregates, streams, running))
+            topic(AGGREGATE, null), values(messages.second.size(), resultAggregates, streams, null))
         .start();
-    assertEquals(messages.second, resultAggregates);
+    assertFunction.accept(messages.second, resultAggregates);
+  }
+
+  protected void runShardedTest(final int numberOfMessages, final int numberOfShards) {
+    final Comparator<JsonObject> c = comparing(json -> json.getInt(VALUE));
+
+    runPerformanceTest(
+        numberOfMessages,
+        numberOfShards,
+        false,
+        Base::createTestMessagesPut,
+        (expected, result) -> {
+          assertEquals(expected.size(), result.size());
+          zip(expected.stream().sorted(c), result.stream().sorted(c))
+              .forEach(pair -> assertEquals(pair.first, pair.second));
+        });
   }
 
   protected void runTest(final String name) {
@@ -500,13 +589,16 @@ class Base {
             Source.of(inputMessages(loadMessages(resource(name, COMMAND)))))
         .consume(
             topic(AGGREGATE, environment),
-            values(expectedAggregates, resultAggregates, streams, running))
-        .consume(topic(EVENT, environment), values(expectedEvents, resultEvents, streams, running))
+            values(expectedAggregates.size(), resultAggregates, streams, running))
+        .consume(
+            topic(EVENT, environment),
+            values(expectedEvents.size(), resultEvents, streams, running))
         .consume(
             topic(EVENT_FULL, environment),
-            values(expectedEventsFull, resultEventsFull, streams, running))
+            values(expectedEventsFull.size(), resultEventsFull, streams, running))
         .consume(
-            topic(REPLY, environment), values(expectedReplies, resultReplies, streams, running))
+            topic(REPLY, environment),
+            values(expectedReplies.size(), resultReplies, streams, running))
         .start();
 
     assertEquals(expectedEventsFull, resultEventsFull);
