@@ -5,6 +5,12 @@ import org.junit.jupiter.api.Test;
 
 class TestAggregate extends Base {
   @Test
+  @DisplayName("disrupt")
+  void disrupt() {
+    runDisruptionTest(50000, 10);
+  }
+
+  @Test
   @DisplayName("patch")
   void patch() {
     runTest("patch");
@@ -16,6 +22,12 @@ class TestAggregate extends Base {
   void patchBad() {
     runTest("patch_bad");
     runTest("patch_bad", "dev", true);
+  }
+
+  @Test
+  @DisplayName("performance")
+  void performance() {
+    runPerformanceTest(10000);
   }
 
   @Test
@@ -51,12 +63,6 @@ class TestAggregate extends Base {
   void putGoodUser() {
     runTest("put_good_user");
     runTest("put_good_user", "dev", true);
-  }
-
-  @Test
-  @DisplayName("performance")
-  void performance() {
-    runPerformanceTest(10000);
   }
 
   @Test

@@ -2,11 +2,13 @@ package net.pincette.jes;
 
 import static java.lang.Integer.MAX_VALUE;
 import static java.time.Duration.ofSeconds;
+import static java.time.Instant.now;
 import static java.util.Comparator.comparing;
 import static java.util.Optional.ofNullable;
 import static java.util.UUID.randomUUID;
 import static java.util.concurrent.CompletableFuture.completedFuture;
 import static java.util.logging.LogManager.getLogManager;
+import static java.util.logging.Logger.getGlobal;
 import static java.util.logging.Logger.getLogger;
 import static java.util.stream.Collectors.toSet;
 import static net.pincette.jes.Commands.GET;
@@ -65,18 +67,23 @@ import static org.reactivestreams.FlowAdapters.toFlowPublisher;
 import java.io.File;
 import java.io.FileReader;
 import java.net.URI;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.Comparator;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Random;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.Flow.Processor;
 import java.util.concurrent.Flow.Publisher;
+import java.util.concurrent.Flow.Subscriber;
+import java.util.concurrent.Future;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.BiConsumer;
 import java.util.function.Consumer;
@@ -95,12 +102,14 @@ import net.pincette.rs.kafka.ConsumerEvent;
 import net.pincette.rs.streams.Message;
 import net.pincette.rs.streams.Streams;
 import net.pincette.util.Pair;
+import net.pincette.util.State;
 import org.apache.kafka.clients.admin.Admin;
 import org.apache.kafka.clients.admin.NewTopic;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.apache.kafka.clients.consumer.KafkaConsumer;
 import org.apache.kafka.clients.producer.KafkaProducer;
 import org.apache.kafka.clients.producer.ProducerRecord;
+import org.apache.kafka.clients.producer.RecordMetadata;
 import org.apache.kafka.common.serialization.StringDeserializer;
 import org.apache.kafka.common.serialization.StringSerializer;
 import org.junit.jupiter.api.AfterAll;
@@ -118,6 +127,7 @@ class Base {
   static final String EVENT_FULL = "event-full";
   static final String MINUS = "minus";
   static final String PLUS = "plus";
+  static final Random RANDOM = new Random();
   static final String REPLY = "reply";
   private static final JsonObject SYSTEM = o(f(SUB, v("system")));
   static final String TYPE = "test";
@@ -226,6 +236,16 @@ class Base {
                 .withReducer(PLUS, (command, currentState) -> reduce(currentState, v -> v + 1))
                 .withReducer(MINUS, (command, currentState) -> reduce(currentState, v -> v - 1)))
         .build();
+  }
+
+  private static BiConsumer<List<JsonObject>, List<JsonObject>> assertSharded(final String field) {
+    final Comparator<JsonObject> c = comparing(json -> json.getInt(field));
+
+    return (expected, result) -> {
+      assertEquals(expected.size(), result.size());
+      zip(expected.stream().sorted(c), result.stream().sorted(c))
+          .forEach(pair -> assertEquals(pair.first, pair.second));
+    };
   }
 
   @BeforeAll
@@ -359,14 +379,14 @@ class Base {
           JsonObject,
           ConsumerRecord<String, JsonObject>,
           ProducerRecord<String, JsonObject>>
-      createStreams() {
+      createStreams(final boolean toBeginning) {
     return Streams.streams(
         fromPublisher(
             publisher(Base::consumer)
                 .withMaximumMessageLag(-1)
                 .withEventHandler(
                     (event, consumer) -> {
-                      if (event == ConsumerEvent.STARTED) {
+                      if (event == ConsumerEvent.STARTED && toBeginning) {
                         consumer.seekToBeginning(consumer.assignment());
                       }
                     })),
@@ -421,6 +441,26 @@ class Base {
 
   private static NewTopic newTopic(final String name, final String environment) {
     return new NewTopic(topic(name, environment), 1, (short) 1);
+  }
+
+  private static void preloadCommands(final List<JsonObject> messages, final String environment) {
+    Future<RecordMetadata> future = null;
+    final KafkaProducer<String, JsonObject> producer = producer();
+    final String topic = topic(COMMAND, environment);
+
+    for (Message<String, JsonObject> m : inputMessages(messages)) {
+      future = producer.send(new ProducerRecord<>(topic, m.key, m.value));
+    }
+
+    if (future != null) {
+      try {
+        future.get();
+      } catch (Exception ignored) {
+        // Not interested.
+      }
+    }
+
+    producer.close();
   }
 
   private static KafkaProducer<String, JsonObject> producer() {
@@ -489,17 +529,28 @@ class Base {
               ProducerRecord<String, JsonObject>>
           streams,
       final AtomicInteger running) {
-    return pub ->
-        pub.subscribe(
-            lambdaSubscriber(
-                message -> {
-                  results.add(removeTimestamps(message).value);
+    return pub -> pub.subscribe(valuesSubscriber(numberOfMessages, results, streams, running));
+  }
 
-                  if (results.size() == numberOfMessages
-                      && (running == null || running.decrementAndGet() == 0)) {
-                    streams.stop();
-                  }
-                }));
+  private static Subscriber<Message<String, JsonObject>> valuesSubscriber(
+      final int numberOfMessages,
+      final List<JsonObject> results,
+      final Streams<
+              String,
+              JsonObject,
+              ConsumerRecord<String, JsonObject>,
+              ProducerRecord<String, JsonObject>>
+          streams,
+      final AtomicInteger running) {
+    return lambdaSubscriber(
+        message -> {
+          results.add(removeTimestamps(message).value);
+
+          if (results.size() == numberOfMessages
+              && (running == null || running.decrementAndGet() == 0)) {
+            streams.stop();
+          }
+        });
   }
 
   @AfterEach
@@ -516,6 +567,64 @@ class Base {
     deleteTopics("dev");
     createTopics(null);
     createTopics("dev");
+  }
+
+  protected void runDisruptionTest(final int numberOfMessages, final int numberOfShards) {
+    final State<Boolean> first = new State<>(true);
+    final State<Instant> lastStop = new State<>(now());
+    final Pair<List<JsonObject>, List<JsonObject>> messages =
+        createTestMessagesPut(numberOfMessages);
+    final List<JsonObject> resultAggregates = new ArrayList<>();
+    final AtomicInteger running = new AtomicInteger(1);
+    final Set<String> seen = new HashSet<>();
+    final Supplier<
+            Streams<
+                String,
+                JsonObject,
+                ConsumerRecord<String, JsonObject>,
+                ProducerRecord<String, JsonObject>>>
+        streams =
+            () -> {
+              final var s = createStreams(first.get());
+
+              first.set(false);
+
+              return aggregate(s, null, true, false, numberOfShards)
+                  .from(
+                      topic(AGGREGATE, null),
+                      map(
+                          msg -> {
+                            if (lastStop.get().plusMillis(2000).isBefore(now())) {
+                              lastStop.set(now());
+                              s.stop();
+                            }
+
+                            if (resultAggregates.size() % 100 == 0) {
+                              getGlobal().info(() -> "Processed " + resultAggregates.size());
+                            }
+
+                            final var corr = msg.value.getString(CORR);
+
+                            return Optional.of(msg)
+                                .filter(m -> !seen.contains(corr))
+                                .map(
+                                    m -> {
+                                      seen.add(corr);
+                                      return m;
+                                    })
+                                .orElse(null);
+                          }))
+                  .subscribe(
+                      valuesSubscriber(messages.second.size(), resultAggregates, s, running));
+            };
+
+    preloadCommands(messages.first, null);
+
+    while (running.get() > 0) {
+      streams.get().start();
+    }
+
+    assertSharded(VALUE).accept(messages.second, resultAggregates);
   }
 
   protected void runPerformanceTest(final int numberOfMessages) {
@@ -537,7 +646,7 @@ class Base {
             JsonObject,
             ConsumerRecord<String, JsonObject>,
             ProducerRecord<String, JsonObject>>
-        streams = createStreams();
+        streams = createStreams(true);
 
     aggregate(streams, null, true, withUnique, numberOfShards)
         .to(topic(COMMAND, null), Source.of(inputMessages(messages.first)))
@@ -548,18 +657,8 @@ class Base {
   }
 
   protected void runShardedTest(final int numberOfMessages, final int numberOfShards) {
-    final Comparator<JsonObject> c = comparing(json -> json.getInt(VALUE));
-
     runPerformanceTest(
-        numberOfMessages,
-        numberOfShards,
-        false,
-        Base::createTestMessagesPut,
-        (expected, result) -> {
-          assertEquals(expected.size(), result.size());
-          zip(expected.stream().sorted(c), result.stream().sorted(c))
-              .forEach(pair -> assertEquals(pair.first, pair.second));
-        });
+        numberOfMessages, numberOfShards, false, Base::createTestMessagesPut, assertSharded(VALUE));
   }
 
   protected void runTest(final String name) {
@@ -581,7 +680,7 @@ class Base {
             JsonObject,
             ConsumerRecord<String, JsonObject>,
             ProducerRecord<String, JsonObject>>
-        streams = createStreams();
+        streams = createStreams(true);
 
     aggregate(streams, environment, withProcessor)
         .to(

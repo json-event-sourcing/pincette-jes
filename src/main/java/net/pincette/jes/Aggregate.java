@@ -2,6 +2,7 @@ package net.pincette.jes;
 
 import static com.mongodb.client.model.Filters.eq;
 import static java.lang.System.currentTimeMillis;
+import static java.time.Duration.ofMillis;
 import static java.time.Duration.ofSeconds;
 import static java.time.Instant.now;
 import static java.util.Arrays.stream;
@@ -53,6 +54,7 @@ import static net.pincette.rs.BackpressureTimout.backpressureTimeout;
 import static net.pincette.rs.Box.box;
 import static net.pincette.rs.Buffer.buffer;
 import static net.pincette.rs.Combine.combine;
+import static net.pincette.rs.Commit.commit;
 import static net.pincette.rs.Filter.filter;
 import static net.pincette.rs.Mapper.map;
 import static net.pincette.rs.NotFilter.notFilter;
@@ -224,6 +226,7 @@ import org.bson.conversions.Bson;
 public class Aggregate<T, U> {
   private static final String AGGREGATE_TOPIC = "aggregate";
   private static final Duration BACK_OFF = ofSeconds(5);
+  private static final Duration BUFFER_TIMEOUT = ofMillis(50);
   private static final String COMMAND_TOPIC = "command";
   private static final Duration DUPLICATE_WINDOW = ofSeconds(5);
   private static final String EVENT_TOPIC = "event";
@@ -602,7 +605,8 @@ public class Aggregate<T, U> {
         .process(
             shards > 1
                 ? sharded(
-                    () -> box(buffer(100), reducer(createSession(client))),
+                    () -> box(buffer(100, BUFFER_TIMEOUT), reducer(createSession(client))),
+                      // The timeout causes quicker command commits when traffic is low.
                     shards,
                     m -> m.key.hashCode())
                 : reducer(createSession(client)))
@@ -869,11 +873,17 @@ public class Aggregate<T, U> {
 
   private Processor<Message<String, JsonObject>, Message<String, JsonObject>> saveProcessor(
       final ClientSession session) {
-    return mapAsyncSequential(
-        m ->
-            !hasError(m.value)
-                ? getForever(() -> save(m.value, session).thenApply(m::withValue))
-                : completedFuture(m));
+    // By putting this in commit phase, we are sure the event is first published on the Kafka
+    // topic. If saving to MongoDB would fail, then the command will be delivered again with the
+    // old state. If the save occurred first, then the command would see the new state, which
+    // would probably have no effect. The consequence is that the event message is logically lost.
+    // By saving last, the event may be emitted twice, but that preserves the at least once
+    // semantics.
+    return commit(
+        list ->
+            !hasError(list.getFirst().value) // Everything is serialised.
+                ? getForever(() -> save(list.getFirst().value, session).thenApply(json -> true))
+                : completedFuture(true));
   }
 
   private CompletionStage<JsonObject> saveReduction(
