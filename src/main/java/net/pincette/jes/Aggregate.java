@@ -228,17 +228,21 @@ public class Aggregate<T, U> {
   private static final Duration BACK_OFF = ofSeconds(5);
   private static final Duration BUFFER_TIMEOUT = ofMillis(50);
   private static final String COMMAND_TOPIC = "command";
+  private static final String CONSUME = "consume";
   private static final Duration DUPLICATE_WINDOW = ofSeconds(5);
   private static final String EVENT_TOPIC = "event";
   private static final String EVENT_FULL_TOPIC = "event-full";
   private static final String EXCEPTION = "exception";
+  private static final String INVALID = "invalid";
   private static final String MESSAGE = "message";
+  private static final String PRODUCE = "produce";
   private static final String REDUCER_COMMAND = "command";
   private static final String REDUCER_STATE = "state";
   private static final String REPLY_TOPIC = "reply";
   private static final String SET = "$set";
   private static final Set<String> TECHNICAL_FIELDS =
       set(COMMAND, CORR, ID, JWT, LANGUAGES, SEQ, TEST, TIMESTAMP, TYPE);
+  private static final String TOPIC = "topic";
   private static final String UNIQUE_TOPIC = "unique";
 
   private final Map<
@@ -260,6 +264,10 @@ public class Aggregate<T, U> {
   private Logger logger;
   private Reducer reducer;
   private int shards = 1;
+  private Function<
+          Function<Message<String, JsonObject>, String>,
+          Processor<Message<String, JsonObject>, Message<String, JsonObject>>>
+      telemetryProcessor;
   private String type;
   private JsonValue uniqueExpression;
   private Function<JsonObject, JsonValue> uniqueFunction;
@@ -328,6 +336,10 @@ public class Aggregate<T, U> {
                     .orElseGet(() -> now().toEpochMilli()))
             .build()
         : command;
+  }
+
+  private static String consumeName(final String topic) {
+    return TOPIC + "." + topic + "." + CONSUME;
   }
 
   private static JsonObjectBuilder createAfter(
@@ -473,6 +485,10 @@ public class Aggregate<T, U> {
     return database.withReadConcern(ReadConcern.MAJORITY).withWriteConcern(WriteConcern.MAJORITY);
   }
 
+  private static String produceName(final String topic) {
+    return TOPIC + "." + topic + "." + PRODUCE;
+  }
+
   /**
    * The standard put reducer. It just removes the <code>_command</code> field and uses everything
    * else as the new state of the aggregate.
@@ -593,9 +609,13 @@ public class Aggregate<T, U> {
     aggregateCollection =
         Optional.of(database).map(d -> d.getCollection(mongoAggregateCollection())).orElse(null);
 
+    final var aggregateTopic = topic(AGGREGATE_TOPIC);
     final Processor<Message<String, JsonObject>, Message<String, JsonObject>> errors = errors();
     final Processor<Message<String, JsonObject>, Message<String, JsonObject>> eventsFull =
         eventsFull();
+    final var eventFullTopic = topic(EVENT_FULL_TOPIC);
+    final var eventTopic = topic(EVENT_TOPIC);
+    final var replyTopic = topic(REPLY_TOPIC);
 
     return commandSource(createCommands())
         .process(
@@ -606,29 +626,55 @@ public class Aggregate<T, U> {
             shards > 1
                 ? sharded(
                     () -> box(buffer(100, BUFFER_TIMEOUT), reducer(createSession(client))),
-                      // The timeout causes quicker command commits when traffic is low.
+                    // The timeout causes quicker command commits when traffic is low.
                     shards,
                     m -> m.key.hashCode())
                 : reducer(createSession(client)))
         .subscribe(Fanout.of(eventsFull, errors))
-        .to(topic(EVENT_FULL_TOPIC), eventsFull)
-        .to(topic(REPLY_TOPIC), errors)
-        .from(topic(EVENT_FULL_TOPIC), aggregates())
-        .to(topic(REPLY_TOPIC))
-        .from(topic(EVENT_FULL_TOPIC), aggregates())
-        .to(topic(AGGREGATE_TOPIC))
-        .from(topic(EVENT_FULL_TOPIC), events())
-        .to(topic(EVENT_TOPIC));
+        .to(eventFullTopic, box(eventsFull, telemetryProcessor(m -> produceName(eventFullTopic))))
+        .to(
+            replyTopic,
+            box(errors, telemetryProcessor(m -> produceName(replyTopic) + "." + INVALID)))
+        .from(
+            eventFullTopic,
+            pipe(telemetryProcessor(m -> consumeName(eventFullTopic)))
+                .then(aggregates())
+                .then(telemetryProcessor(m -> produceName(replyTopic))))
+        .to(replyTopic)
+        .from(
+            eventFullTopic,
+            pipe(telemetryProcessor(m -> consumeName(eventFullTopic)))
+                .then(aggregates())
+                .then(telemetryProcessor(m -> produceName(aggregateTopic))))
+        .to(aggregateTopic)
+        .from(
+            eventFullTopic,
+            pipe(telemetryProcessor(m -> consumeName(eventFullTopic)))
+                .then(events())
+                .then(telemetryProcessor(m -> produceName(eventTopic))))
+        .to(eventTopic);
   }
 
   private Streams<String, JsonObject, T, U> commandSource(
       final Processor<Message<String, JsonObject>, Message<String, JsonObject>> commands) {
+    final var commandTopic = topic(COMMAND_TOPIC);
+    final var uniqueTopic = topic(UNIQUE_TOPIC);
+
     return uniqueFunction != null
         ? builder
-            .from(topic(COMMAND_TOPIC), unique(uniqueFunction))
-            .to(topic(UNIQUE_TOPIC))
-            .from(topic(UNIQUE_TOPIC), box(filter(m -> isCommand(m.value)), commands))
-        : builder.from(topic(COMMAND_TOPIC), commands);
+            .from(
+                commandTopic,
+                pipe(telemetryProcessor(m -> consumeName(commandTopic)))
+                    .then(unique(uniqueFunction))
+                    .then(telemetryProcessor(m -> produceName(uniqueTopic))))
+            .to(uniqueTopic)
+            .from(
+                uniqueTopic,
+                pipe(telemetryProcessor(m -> consumeName(uniqueTopic)))
+                    .then(filter(m -> isCommand(m.value)))
+                    .then(commands))
+        : builder.from(
+            commandTopic, box(telemetryProcessor(m -> consumeName(commandTopic)), commands));
   }
 
   private Processor<Message<String, JsonObject>, Message<String, JsonObject>> createCommands() {
@@ -892,6 +938,11 @@ public class Aggregate<T, U> {
     return isEvent(reduction) ? handleAggregate.apply(reduction) : completedFuture(reduction);
   }
 
+  private Processor<Message<String, JsonObject>, Message<String, JsonObject>> telemetryProcessor(
+      final Function<Message<String, JsonObject>, String> name) {
+    return telemetryProcessor != null ? telemetryProcessor.apply(name) : passThrough();
+  }
+
   /**
    * Returns the topic name in the form &lt;application&gt;-&lt;type&gt;-purpose-&lt;
    * environment&gt;.
@@ -1142,6 +1193,24 @@ public class Aggregate<T, U> {
    */
   public Aggregate<T, U> withShards(final int shards) {
     this.shards = shards;
+
+    return this;
+  }
+
+  /**
+   * Sets a function that creates a processor that emits distributed traces. When set, it is
+   * inserted in several capture points.
+   *
+   * @param telemetryProcessor the function that creates the processor.
+   * @return The aggregate object itself.
+   * @since 4.1.0
+   */
+  public Aggregate<T, U> withTelemetryProcessor(
+      final Function<
+              Function<Message<String, JsonObject>, String>,
+              Processor<Message<String, JsonObject>, Message<String, JsonObject>>>
+          telemetryProcessor) {
+    this.telemetryProcessor = telemetryProcessor;
 
     return this;
   }
