@@ -7,7 +7,7 @@ class TestAggregate extends Base {
   @Test
   @DisplayName("disrupt")
   void disrupt() {
-    runDisruptionTest(50000, 10);
+    runDisruptionTest(50000);
   }
 
   @Test
@@ -63,29 +63,5 @@ class TestAggregate extends Base {
   void putGoodUser() {
     runTest("put_good_user");
     runTest("put_good_user", "dev", true);
-  }
-
-  @Test
-  @DisplayName("sharded 1")
-  void sharded1() {
-    runShardedTest(2, 2);
-  }
-
-  @Test
-  @DisplayName("sharded 2")
-  void sharded2() {
-    runShardedTest(10000, 1);
-  }
-
-  @Test
-  @DisplayName("sharded 3")
-  void sharded3() {
-    runShardedTest(10000, 2);
-  }
-
-  @Test
-  @DisplayName("sharded 4")
-  void sharded4() {
-    runShardedTest(10000, 10);
   }
 }

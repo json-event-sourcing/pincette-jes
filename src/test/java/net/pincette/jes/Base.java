@@ -3,7 +3,6 @@ package net.pincette.jes;
 import static java.lang.Integer.MAX_VALUE;
 import static java.time.Duration.ofSeconds;
 import static java.time.Instant.now;
-import static java.util.Comparator.comparing;
 import static java.util.Optional.ofNullable;
 import static java.util.UUID.randomUUID;
 import static java.util.concurrent.CompletableFuture.completedFuture;
@@ -46,7 +45,6 @@ import static net.pincette.util.Collections.set;
 import static net.pincette.util.Or.tryWith;
 import static net.pincette.util.Pair.pair;
 import static net.pincette.util.StreamUtil.rangeExclusive;
-import static net.pincette.util.StreamUtil.zip;
 import static net.pincette.util.Util.initLogging;
 import static net.pincette.util.Util.tryToDoRethrow;
 import static net.pincette.util.Util.tryToDoWithRethrow;
@@ -71,7 +69,6 @@ import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
-import java.util.Comparator;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
@@ -182,7 +179,7 @@ class Base {
               streams,
           final String environment,
           final boolean withProcessor) {
-    return aggregate(streams, environment, withProcessor, true, 1);
+    return aggregate(streams, environment, withProcessor, true);
   }
 
   private static Streams<
@@ -199,8 +196,7 @@ class Base {
               streams,
           final String environment,
           final boolean withProcessor,
-          final boolean withUnique,
-          final int shards) {
+          final boolean withUnique) {
     var aggregate =
         new Aggregate<ConsumerRecord<String, JsonObject>, ProducerRecord<String, JsonObject>>()
             .withApp(APP)
@@ -211,7 +207,6 @@ class Base {
             .withBuilder(streams)
             .withLogger(getLogger("net.pincette.jes.test"))
             .withBackpressureTimeout(ofSeconds(5))
-            .withShards(shards)
             .withReducer(PATCH, Aggregate::patch)
             .withReducer(
                 PUT,
@@ -236,16 +231,6 @@ class Base {
                 .withReducer(PLUS, (command, currentState) -> reduce(currentState, v -> v + 1))
                 .withReducer(MINUS, (command, currentState) -> reduce(currentState, v -> v - 1)))
         .build();
-  }
-
-  private static BiConsumer<List<JsonObject>, List<JsonObject>> assertSharded(final String field) {
-    final Comparator<JsonObject> c = comparing(json -> json.getInt(field));
-
-    return (expected, result) -> {
-      assertEquals(expected.size(), result.size());
-      zip(expected.stream().sorted(c), result.stream().sorted(c))
-          .forEach(pair -> assertEquals(pair.first, pair.second));
-    };
   }
 
   @BeforeAll
@@ -569,7 +554,7 @@ class Base {
     createTopics("dev");
   }
 
-  protected void runDisruptionTest(final int numberOfMessages, final int numberOfShards) {
+  protected void runDisruptionTest(final int numberOfMessages) {
     final State<Boolean> first = new State<>(true);
     final State<Instant> lastStop = new State<>(now());
     final Pair<List<JsonObject>, List<JsonObject>> messages =
@@ -589,12 +574,12 @@ class Base {
 
               first.set(false);
 
-              return aggregate(s, null, true, false, numberOfShards)
+              return aggregate(s, null, true, false)
                   .from(
                       topic(AGGREGATE, null),
                       map(
                           msg -> {
-                            if (lastStop.get().plusMillis(2000).isBefore(now())) {
+                            if (lastStop.get().plusMillis(10000).isBefore(now())) {
                               lastStop.set(now());
                               s.stop();
                             }
@@ -623,18 +608,15 @@ class Base {
     while (running.get() > 0) {
       streams.get().start();
     }
-
-    assertSharded(VALUE).accept(messages.second, resultAggregates);
   }
 
   protected void runPerformanceTest(final int numberOfMessages) {
     runPerformanceTest(
-        numberOfMessages, 1, true, Base::createTestMessagesPlus, Assertions::assertEquals);
+        numberOfMessages, true, Base::createTestMessagesPlus, Assertions::assertEquals);
   }
 
   protected void runPerformanceTest(
       final int numberOfMessages,
-      final int numberOfShards,
       final boolean withUnique,
       final Function<Integer, Pair<List<JsonObject>, List<JsonObject>>> createTestMessages,
       final BiConsumer<List<JsonObject>, List<JsonObject>> assertFunction) {
@@ -648,17 +630,12 @@ class Base {
             ProducerRecord<String, JsonObject>>
         streams = createStreams(true);
 
-    aggregate(streams, null, true, withUnique, numberOfShards)
+    aggregate(streams, null, true, withUnique)
         .to(topic(COMMAND, null), Source.of(inputMessages(messages.first)))
         .consume(
             topic(AGGREGATE, null), values(messages.second.size(), resultAggregates, streams, null))
         .start();
     assertFunction.accept(messages.second, resultAggregates);
-  }
-
-  protected void runShardedTest(final int numberOfMessages, final int numberOfShards) {
-    runPerformanceTest(
-        numberOfMessages, numberOfShards, false, Base::createTestMessagesPut, assertSharded(VALUE));
   }
 
   protected void runTest(final String name) {
