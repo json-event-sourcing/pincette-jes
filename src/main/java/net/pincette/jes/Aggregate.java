@@ -2,7 +2,6 @@ package net.pincette.jes;
 
 import static com.mongodb.client.model.Filters.eq;
 import static java.lang.System.currentTimeMillis;
-import static java.time.Duration.ofMillis;
 import static java.time.Duration.ofSeconds;
 import static java.time.Instant.now;
 import static java.util.Arrays.stream;
@@ -63,7 +62,6 @@ import static net.pincette.rs.Pipe.pipe;
 import static net.pincette.rs.Util.asValue;
 import static net.pincette.rs.Util.carryOver;
 import static net.pincette.rs.Util.duplicateFilter;
-import static net.pincette.rs.Util.sharded;
 import static net.pincette.rs.streams.Message.message;
 import static net.pincette.util.Builder.create;
 import static net.pincette.util.Collections.set;
@@ -226,7 +224,6 @@ import org.bson.conversions.Bson;
 public class Aggregate<T, U> {
   private static final String AGGREGATE_TOPIC = "aggregate";
   private static final Duration BACK_OFF = ofSeconds(5);
-  private static final Duration BUFFER_TIMEOUT = ofMillis(50);
   private static final String COMMAND_TOPIC = "command";
   private static final String CONSUME = "consume";
   private static final Duration DUPLICATE_WINDOW = ofSeconds(5);
@@ -263,7 +260,6 @@ public class Aggregate<T, U> {
   private String environment;
   private Logger logger;
   private Reducer reducer;
-  private int shards = 1;
   private Function<
           Function<Message<String, JsonObject>, String>,
           Processor<Message<String, JsonObject>, Message<String, JsonObject>>>
@@ -622,14 +618,7 @@ public class Aggregate<T, U> {
             backpressureTimeout(
                 backpressureTimeout,
                 () -> "No backpressure signal from the reducer of the app " + fullType()))
-        .process(
-            shards > 1
-                ? sharded(
-                    () -> box(buffer(100, BUFFER_TIMEOUT), reducer(createSession(client))),
-                    // The timeout causes quicker command commits when traffic is low.
-                    shards,
-                    m -> m.key.hashCode())
-                : reducer(createSession(client)))
+        .process(reducer(createSession(client)))
         .subscribe(Fanout.of(eventsFull, errors))
         .to(eventFullTopic, box(eventsFull, telemetryProcessor(m -> produceName(eventFullTopic))))
         .to(
@@ -759,9 +748,9 @@ public class Aggregate<T, U> {
 
   private CompletionStage<JsonObject> handleAggregate(
       final JsonObject reduction, final ClientSession session) {
-    return tryWith(() -> deleteReduction(reduction, session).orElse(null))
-        .or(() -> updateReductionNew(reduction, session).orElse(null))
-        .or(() -> updateReductionExisting(reduction, session).orElse(null))
+    return tryWith(() -> deleteReduction(reduction, session))
+        .or(() -> updateReductionNew(reduction, session))
+        .or(() -> updateReductionExisting(reduction, session))
         .get()
         .map(result -> result.thenApply(res -> must(res, r -> r)).thenApply(res -> reduction))
         .orElseGet(() -> completedFuture(reduction));
@@ -1180,19 +1169,6 @@ public class Aggregate<T, U> {
    */
   public Aggregate<T, U> withReducer(final Reducer reducer) {
     this.reducer = reducer;
-
-    return this;
-  }
-
-  /**
-   * Sets the number of shards, which increases parallelism through consistent hashing.
-   *
-   * @param shards the number of shards.
-   * @return The aggregate object itself.
-   * @since 4.0.0
-   */
-  public Aggregate<T, U> withShards(final int shards) {
-    this.shards = shards;
 
     return this;
   }
