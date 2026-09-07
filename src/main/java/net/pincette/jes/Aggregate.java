@@ -861,10 +861,10 @@ public class Aggregate<T, U> {
                 reducer,
                 m -> pair(command(m), state(m)),
                 (newState, pair) ->
-                    hasError(newState.value)
-                        ? newState.withValue(merge(pair.first, newState.value))
-                        : newState.withValue(
-                            processNewState(pair.second, newState.value, pair.first))))
+                    newState.withValue(
+                        hasError(newState.value)
+                            ? merge(pair.first, newState.value)
+                            : processNewState(pair.second, newState.value, pair.first))))
         .then(saveProcessor(session))
         .then(buffer(1)); // Ensure serialisation.
   }
